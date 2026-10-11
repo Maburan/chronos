@@ -10,6 +10,7 @@ for Postgres rather than embedding a DSN in source.
 from __future__ import annotations
 
 import os
+import socket
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -84,20 +85,46 @@ class RelayConfig:
         )
 
 
+def derive_worker_id(task_type: str, *, hostname: Optional[str] = None) -> str:
+    """The deterministic worker-id scheme used when ``CHRONOS_WORKER_ID``
+    is not set explicitly: ``worker-<task_type>-<hostname>``.
+
+    ``hostname`` defaults to ``socket.gethostname()``. This is what makes
+    horizontal scaling work: under Docker Compose ``--scale``, every
+    replica of the same worker service shares one env/config but gets its
+    own unique container hostname (the container id), assigned once at
+    container start and immutable for that container's whole lifetime. So
+    the derived id is (a) unique across replicas, (b) stable for the life
+    of the process, and (c) never random -- exactly the three properties
+    lease-ownership fencing (``lease_owner``) requires. Factored out (not
+    inlined in ``from_env``) so the scheme can be unit-tested directly and
+    referenced from one place (see tests/test_worker_identity.py)."""
+    resolved = hostname if hostname is not None else socket.gethostname()
+    return f"worker-{task_type}-{resolved}"
+
+
 @dataclass(frozen=True)
 class WorkerConfig:
-    """Worker tuning. ``worker_id`` must be a stable, externally
-    supplied identifier -- never generated per-process here, since
-    ``claim_task_by_id``'s lease-ownership fencing (``lease_owner``) is
-    only meaningful if the same worker_id is used consistently across a
-    process's lifetime (and, operationally, across restarts if you want
-    logs/leases to correlate to "the same worker"). No distributed worker
-    registry is introduced -- this is just a required, explicit,
-    environment-configured value, exactly like ``CHRONOS_RABBITMQ_URL``.
+    """Worker tuning. ``worker_id`` must be a stable identifier for the
+    lifetime of the process, since ``claim_task_by_id``'s lease-ownership
+    fencing (``lease_owner``) is only meaningful if the same worker_id is
+    used consistently across that lifetime. It may be supplied explicitly
+    via ``CHRONOS_WORKER_ID`` (the pre-existing behavior, preserved), or --
+    when that is not set -- derived deterministically from the container
+    hostname as ``worker-<task_type>-<hostname>`` (see
+    :func:`derive_worker_id`). The derived form is what lets multiple
+    replicas of one worker *service* (``docker compose up --scale
+    worker-echo=3``) each get a distinct, lifetime-stable id from a single
+    shared service definition, without hand-defining a separate service per
+    replica. No distributed worker registry is introduced; nothing here is
+    ever a per-process *random* value that could change mid-lifetime.
 
     ``task_type`` fixes which single task-type queue this worker process
-    consumes (one worker process per task-type queue, matching the
-    topology's 1:1 per-type queue design -- see mq/topology.py).
+    consumes. Multiple worker instances may consume the SAME task-type
+    queue concurrently (that is exactly what horizontal scaling means
+    here) -- the topology stays one durable queue per type (see
+    mq/topology.py); scaling adds consumers to that one queue, never new
+    queues.
     """
 
     worker_id: str
@@ -111,19 +138,16 @@ class WorkerConfig:
 
     @classmethod
     def from_env(cls) -> "WorkerConfig":
-        worker_id = os.environ.get("CHRONOS_WORKER_ID")
-        if not worker_id:
-            raise ConfigError(
-                "CHRONOS_WORKER_ID is not set; every worker must have a "
-                "stable, externally configured worker_id, never a "
-                "hard-coded or auto-generated one"
-            )
         task_type = os.environ.get("CHRONOS_WORKER_TASK_TYPE")
         if not task_type:
             raise ConfigError(
                 "CHRONOS_WORKER_TASK_TYPE is not set; a worker "
                 "process consumes exactly one task-type queue"
             )
+        # Explicit id wins (unchanged behavior); otherwise derive a
+        # unique, lifetime-stable id from the container hostname so that
+        # scaled replicas of one service never collide on lease ownership.
+        worker_id = os.environ.get("CHRONOS_WORKER_ID") or derive_worker_id(task_type)
         raw_heartbeat_interval = os.environ.get("CHRONOS_WORKER_HEARTBEAT_INTERVAL_SECONDS")
         return cls(
             worker_id=worker_id,

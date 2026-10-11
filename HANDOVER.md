@@ -1,9 +1,401 @@
 # Chronos — Handover (for the next Claude session)
 
-Written at the end of a session that completed Phase 12 and a publication
-cleanup pass. This document exists so a **fresh Claude session tomorrow**
-can pick up work without re-deriving context from scratch. Read this
-before touching any code.
+## Current Status (most recent session — autoscaling — READ THIS FIRST)
+
+**Horizontal worker scaling and policy-based autoscaling are both
+implemented, tested, and Docker-verified.** These are the two most recent
+backend phases (after the frontend redesign summarized below).
+
+**Horizontal scaling.** Multiple replicas of one worker service consume the
+one `chronos.tasks.<task_type>` queue (`docker compose up -d --scale
+worker-echo=3`). The only change it required was making `CHRONOS_WORKER_ID`
+optional: when unset, `mq.config.derive_worker_id` derives a unique,
+lifetime-stable `worker-<task_type>-<hostname>` from the container id, so
+every replica has a distinct lease owner and fencing/heartbeat/reaper stay
+correct. PostgreSQL's atomic claim (unchanged) is what makes N consumers on
+one queue safe.
+
+**Autoscaling** (`autoscaler/` package + `autoscaler` Compose service,
+`python -m autoscaler`). A control loop that observes per-task-type backlog
+and scales each worker service between MIN/MAX replicas:
+
+- **Signal:** `READY` task count per task type from PostgreSQL
+  (`db.persistence.get_backlog_counts` — new read-only query; RUNNING and
+  terminal/PENDING are not backlog). No second source of truth; RabbitMQ
+  depth is deliberately not used.
+- **Policy** (`autoscaler/policy.py`): pure `backlog -> desired` step table,
+  clamped to `[min,max]`. **Not ML.**
+- **Runtime** (`autoscaler/runtime.py`): `WorkerRuntime` protocol +
+  `DockerComposeRuntime` (shells `docker compose up -d --no-deps
+  --no-recreate --scale worker-<type>=N` via the mounted Docker socket;
+  auto-detects its own compose project). A `KubernetesRuntime` can be added
+  later with no policy change.
+- **Anti-thrash** (`autoscaler/autoscaler.py`): scale-up needs N consecutive
+  observations (fast); scale-down needs a quiet cooldown (slow); no-op when
+  `desired == current`; deduped logging.
+- **Safety:** only changes replica counts — never touches task state, leases,
+  or acks. Scale-down = graceful SIGTERM (worker finishes its current task;
+  `stop_grace_period: 30s`) with the Reaper as backstop for hard kills.
+
+**Key architectural decision made this phase:** worker services no longer
+bind-mount `- .:/app`. They run the code **baked into the image** (`COPY .
+.`). Reason: the autoscaler runs `docker compose --scale` from *inside* a
+container, where a relative `.:/app` host mount does not resolve to the
+source tree — scaled replicas came up with an empty `/app` and crash-looped
+(`No module named worker`). Baked-in code makes a replica work regardless of
+who created it. Trade-off: update worker code with `docker compose build
+worker-<type> && docker compose up -d worker-<type>` (workers never
+hot-reloaded anyway). api/relay/reaper/autoscaler keep their bind-mounts
+(host-started, never autoscaled).
+
+**Config** (env / `.env`, see `.env.example` + `autoscaler/config.py`):
+`CHRONOS_AUTOSCALER_ENABLED` (1 in `.env` for the stack), `_INTERVAL` (10s),
+`_MIN_REPLICAS` (1), `_MAX_REPLICAS` (5), `_SCALE_UP_STABILIZATION` (2),
+`_SCALE_DOWN_COOLDOWN` (60s), `_BACKLOG_TIERS`, `_TASK_TYPES`,
+`_SERVICE_PREFIX`, `_COMPOSE_PROJECT`.
+
+**Files:** new `autoscaler/{__init__,config,policy,runtime,autoscaler,
+__main__}.py` + `autoscaler/Dockerfile`; `db/queries.py` +
+`db/persistence.py` (backlog query/fn); `docker-compose.yml` (autoscaler
+service, worker `stop_grace_period`, worker bind-mounts removed);
+`.env`/`.env.example`. Tests: `tests/test_autoscaler_policy.py`,
+`_config.py`, `_runtime.py`, `test_autoscaler.py`, `_backlog.py` (DB),
+`_integration.py` (DB). **Not modified:** `core/transitions.py`,
+`db/persistence.py` transition logic, the outbox, RabbitMQ model, worker
+execution.
+
+**Verification (actual):** full suite **508 passed, 7 skipped, 0 failed**
+(7 skipped = redis-limiter integration, needs `CHRONOS_TEST_REDIS_URL`);
+`git diff --check` clean. Docker E2E: backlog of 40 echo tasks scaled
+`worker-echo` **1→5** in ~20s, five consumers on one queue, up to **4
+distinct replicas executing concurrently**, then **5→1** after the 60s
+cooldown once drained; all 40 SUCCEEDED. Crash test: hard-killed a replica
+mid-task → Reaper reclaimed → another replica completed it (attempt 2,
+SUCCEEDED) with the autoscaler running throughout. `docker compose down`/
+`up` verified. Kubernetes/Kafka/cloud provisioning explicitly NOT added.
+
+**Note on test/Docker env on this machine:** Docker Desktop's engine pipe
+for the Python SDK/testcontainers is `npipe:////./pipe/dockerDesktopLinuxEngine`
+— export `DOCKER_HOST` to it if testcontainers can't reach the daemon. The
+Compose broker publishes AMQP on host port **5673** (`CHRONOS_RABBITMQ_HOST_PORT`),
+so broker-gated tests want
+`CHRONOS_TEST_RABBITMQ_URL=amqp://chronos:chronos_dev_password@localhost:5673/`.
+
+---
+
+## Current Status (earlier session — frontend redesign)
+
+**A full frontend redesign is complete and browser-verified.** The React
+app was rebuilt to a polished, intentional developer-product bar
+(Linear/Vercel/Raycast-inspired) without changing any backend code, API
+contract, or execution/auth semantics. It was done in six deliberate
+passes: (1) a cohesive design system in `frontend/src/index.css` (refined
+amber-accent dark palette, type scale, elevation, motion tokens, and a
+reusable primitive vocabulary — buttons/inputs/badges/cards/sheets/
+tooltips/toasts/tables); (2) a consolidated single top bar
+(`components/TopBar.tsx`, replacing the old two-row Header+NavBar — both
+deleted); (3) dashboard + workflow list as useful, status-aware overviews;
+(4) a **run-centric** workflow detail page; (5) the workflow builder as the
+visual centerpiece; (6) polish, Simple/Advanced parity, states, and
+verification.
+
+**The one genuinely new capability wired in this session:** the backend
+already had a complete, tested **runs API** (`POST /workflows/{id}/runs`,
+`GET …/runs`, `…/runs/{rid}/status`, `…/runs/{rid}/tasks`) that the old
+frontend never used. The redesign adds those functions to
+`frontend/src/api.ts` and builds the whole "define → **Run** → watch live
+→ understand" story on them: the detail page now clearly separates the
+workflow / its definition / its execution, makes **Run workflow** the
+obvious primary action, and live-polls the selected run's status + tasks
+(with a run selector for history). No backend route was added or changed —
+these routes already existed.
+
+New frontend files: `components/TopBar.tsx`, `components/icons.tsx`
+(dependency-free inline SVG icon set — **no icon library added**),
+`components/toast.tsx`, `workflowStatus.ts`. Deleted: `components/
+Header.tsx`, `components/NavBar.tsx`, and `components/PipelineVisual.tsx`
+(an advanced-only static architecture diagram that didn't fit the
+run-centric view and referenced the legacy task-creation path — a
+deliberate removal, noted here). `vite.config.ts` gained
+`server.watch.usePolling` so HMR works reliably over the Windows/Docker
+bind mount (the container's inotify doesn't fire on host edits otherwise).
+
+**No new runtime dependencies were added** (icons are hand-authored SVG;
+motion is CSS). Verified this session: `tsc -b && vite build` (clean,
+212 modules), `oxlint` (0 errors; only pre-existing-style advisory
+warnings), `git diff --check` (clean), the full **448** backend tests
+(still green — no backend files touched), and a real browser pass through
+login/register, dashboard, workflow list, builder (add/configure/connect/
+validate/save), detail, and a live **Run workflow** execution watched from
+READY → RUNNING → SUCCEEDED, plus a FAILED run's skip-propagation and the
+Simple/Advanced toggle. Responsive breakpoints (960px/720px) are in the
+CSS but couldn't be screenshot-verified — the browser tool renders at a
+fixed width regardless of window size; verified by code inspection only.
+
+**A follow-up "make it feel alive" pass** then added purposeful motion
+and execution visualization, all driven by real API state (never
+fabricated): (1) a **live execution graph** on the detail page
+(`components/execution/ExecutionGraph.tsx`, React Flow) that renders a run
+as *work moving through a DAG* — state-coloured nodes, a pulsing running
+node, **animated flow particles** on edges where work is actually moving
+(amber), settled green paths, red dashed dead paths, dimmed skipped
+nodes, smooth state-transition morphs, and click-a-node-to-inspect;
+(2) **MiniDag execution strips** on dashboard/workflow-list cards
+(`components/MiniDag.tsx`) showing each workflow's real latest run as
+`✓─✕─○` dots + `N/M · %`; (3) builder aliveness — node entrance
+animation, a validation **shake** + auto-select on save-with-incomplete,
+and a technical-workspace canvas (dot grid + vignette); (4) global
+micro-interactions (hover lifts, page transitions, press feedback). Pure
+logic lives in `execution.ts` (topological order, per-state counts, edge
+activity) and `workflowOverview.ts` (each workflow's latest-run tasks).
+The old static SVG `DependencyGraph` was replaced by the live graph and
+deleted. Verified live in-browser: watched real runs propagate
+READY→RUNNING→SUCCEEDED and →FAILED→SKIPPED with the graph reacting in
+real time; still no new dependencies, build/lint clean, animations gated
+behind `prefers-reduced-motion` (and particles only render while work is
+genuinely in flight).
+
+**A composition rework** then followed (the previous passes were still a
+"styled admin dashboard" — stacked bordered cards, top nav, boxed graph).
+The layout was rebuilt around the idea that *the workflow canvas is the
+page*: (1) the **detail page** is now a full-bleed `.canvas-page` — the
+run's DAG (laid out **top-down**, work flowing downward) fills the whole
+viewport as an immersive workspace (dot grid + vignette), with the page
+chrome *floating* over it in frosted-glass panels: a contextual header
+(breadcrumb + live status orb + tasks + a per-second elapsed timer +
+progress rail), floating actions (Live/Edit/Run), a floating run selector,
+and a **floating task inspector** that appears over the canvas on node
+click *without dimming it* (`TaskInspectorContent.tsx`); (2) the
+**builder** is the same full-bleed canvas language — floating toolbar +
+floating node inspector; (3) the **dashboard** is an orchestration
+overview, not a stat grid — a hero line, an **ACTIVE spotlight** of the
+workflows genuinely running now (real latest-run task state, showing the
+actual running task's name + a live MiniDag + %), and a lean hairline
+RECENT list. The stat-card grid, the boxed "Execution graph" card, and the
+steps table were removed; `MetricCards`, `TaskList`, `TaskDetailPanel`,
+and the static `DependencyGraph` were deleted. Motion is meaningful and
+real-data-only: flow particles animate only on edges genuinely carrying
+work, running nodes pulse/breathe, the elapsed timer ticks only while a
+run is in progress, all gated behind `prefers-reduced-motion`. Verified
+in-browser at full desktop resolution: watched a real run flow down the
+canvas READY→RUNNING→SUCCEEDED and a failing run go →FAILED→SKIPPED with
+red dead-path edges; the floating inspector, dashboard ACTIVE spotlight,
+and full-bleed builder all confirmed live. Build/tsc/lint/`git diff
+--check` all clean; **no backend files touched, no new dependencies**.
+
+Everything below is the prior **Phase 5** status and remains accurate.
+
+---
+
+## Phase 5 status (previous session)
+
+**Phase 5 (local service orchestration / Docker Compose) is complete and
+verified.** Chronos now starts with one command:
+
+```bash
+cp .env.example .env
+docker compose up --build
+```
+
+This orchestrates PostgreSQL, RabbitMQ, Redis, a one-shot schema
+`migrate` service (`python -m db`), the API, the outbox relay, the
+reaper, one worker container per registered task type (`echo`, `sleep`,
+`http_request`, `python_expression`), and the frontend dev server — as
+**separate containers**, exactly mirroring the existing distributed
+architecture (no service was merged into another; see
+`docker-compose.yml`'s own comments for the full rationale). See
+README.md's new "Docker Compose (recommended)" section under Quick Start
+for the full operator-facing writeup (ports, hot reload, logs, resetting
+volumes, a known-benign first-boot RabbitMQ race).
+
+Files added: `docker-compose.yml`, root `Dockerfile` (shared by
+migrate/api/relay/reaper/worker-\*), `frontend/Dockerfile`,
+`reaper/__main__.py` (previously missing — see the Phase 4 session's
+notes below on this exact gap), `.dockerignore`,
+`frontend/.dockerignore`, `.env.example`. Nothing in
+`core/transitions.py`, `db/persistence.py`, `worker/task_worker.py`,
+`relay/outbox_relay.py`, or `reaper/reaper.py` was touched.
+
+**Verified this session, for real, against a real running stack** (not
+asserted from reading the compose file):
+- `docker compose config` validates cleanly.
+- `docker compose build` builds all 9 images successfully.
+- `docker compose up -d` brings up all 12 containers; `migrate` applies
+  all 4 migrations on a fresh database and exits 0; postgres/rabbitmq/redis
+  all report healthy; `api` reports healthy (`/healthz` and `/readyz`
+  both 200); all 4 worker containers, `relay`, and `reaper` connect and
+  start consuming/polling; the frontend is reachable and serves the app.
+- A real workflow + task was created through the containerized API,
+  dispatched through the containerized outbox → relay → RabbitMQ chain,
+  claimed and executed by the containerized `worker-echo` container, and
+  reached `SUCCEEDED` in about one second — confirmed both via the API's
+  own polling and by reading the literal `echo_task: ... message=...` line
+  in `worker-echo`'s container log.
+- `docker compose down` stops and removes all containers cleanly (no `-v`
+  used); the named volumes (`postgres_data`, `rabbitmq_data`,
+  `frontend_node_modules`) survive.
+- `docker compose up -d` again: `migrate` correctly reports "already up
+  to date" (proving idempotency), and the workflow/task created before
+  `down` was still present afterward with identical data — data
+  persistence across a full stack restart is confirmed, not assumed.
+- The full existing pytest suite (448 tests) was run against real
+  PostgreSQL/RabbitMQ/Redis **hosted inside the Docker stack** (via their
+  published host ports) and passed 448/448 — no regressions introduced.
+
+**One known, benign, cosmetic issue, not fixed by design:** on a cold
+`docker compose up`, RabbitMQ's healthcheck (`rabbitmq-diagnostics -q
+ping`) can report healthy a few seconds before its AMQP listener is fully
+ready to accept connections. `relay` and/or one or two `worker-*`
+containers may crash once with a `pika.exceptions.AMQPConnectionError`
+traceback in that window; Compose's `restart: unless-stopped` policy
+restarts the container automatically and it connects successfully within
+~10-15 seconds. This was observed on both the initial `up` and the
+restart-after-`down` in this session's verification, self-healed both
+times without intervention, and does not represent a hung or broken
+state — `docker compose ps` showing every service settled on "Up" (no
+further restarts) is the signal startup finished. No application code
+change addresses this (nor should it, per this project's own design
+philosophy of tolerating exactly this class of transient failure — see
+§6's fencing/retry invariants below); it could be masked with a longer
+RabbitMQ healthcheck `start_period` purely at the Compose level if it
+ever becomes annoying, but was left as-is since it never actually blocks
+a working stack.
+
+**Local-machine note, not a Chronos issue:** the default host ports in
+`.env.example` (5432/5672/15672/6379/8000/5173) can collide with a
+developer's own natively-running Postgres/RabbitMQ/Redis/Vite — this
+happened on the machine this session ran on. There's no code fix for
+this; if you hit a "port already in use" / bind failure on `docker
+compose up`, change the colliding `*_HOST_PORT` variable(s) in your own
+`.env` (not `.env.example`) to any free port — container-internal ports
+never change, so nothing else needs adjusting.
+
+**Next step:** none required — Phase 5 is done. (Note: two of the
+candidates sketched here have since been built — horizontal worker scaling
+via a hostname-derived `CHRONOS_WORKER_ID`, and policy-based autoscaling on
+top of it; see the "autoscaling" Current Status section at the top of this
+file. A production-oriented multi-stage frontend Dockerfile remains a
+candidate, as does a `KubernetesRuntime` for the autoscaler.)
+
+---
+
+## Phase 4 summary (previous session)
+
+- Phase 4 (frontend visual workflow builder) is implemented and
+  browser-tested.
+- Browser smoke testing verified: node creation/configuration, the node
+  inspector, connections, cycle/self-loop rejection, node dragging,
+  node/edge deletion, zoom/pan, step-picker search/categories, and
+  Simple/Advanced mode.
+- **Save → Reload is now VERIFIED.** `GET`/`PUT /workflows/{id}/definition`
+  both succeed.
+- Root cause of the earlier failure: migration
+  `0004_workflow_definitions_and_runs` was missing from the active
+  Chronos PostgreSQL database — the `task_definitions`,
+  `task_definition_dependencies`, and `workflow_runs` tables simply
+  didn't exist yet on that database. Running `python -m db` (the
+  project's idempotent schema bootstrap) applied migration 0004 and
+  created all three tables.
+- After that, `GET`/`PUT /workflows/{id}/definition` succeeded: a real
+  multi-step definition with a dependency was saved and reloaded via the
+  API with the dependency edge preserved, and separately verified at the
+  browser level — an Echo step was added in the builder UI, saved, the
+  page reloaded, and the step reappeared correctly connected to Start.
+  `/readyz` reports healthy.
+- **No application code was modified** to resolve this issue — it was a
+  database schema/migration state issue, not a code bug.
+- The earlier "stale PostgreSQL connection pool" hypothesis from the
+  prior session was **incorrect** and should not be treated as the
+  current explanation for anything going forward.
+- For the record, the actual infrastructure chain that had to be
+  untangled this session, in order: the PostgreSQL Windows service was
+  stopped; then, once started, the API turned out to be configured
+  against a Postgres instance on port 5433 while a separate PostgreSQL
+  service was listening on the default port 5432 (a port/instance
+  mismatch, not a stale pool); and finally, once the API was correctly
+  talking to the right database, the missing 0004 migration was the
+  actual blocker for the definition endpoints.
+- **Phase 4 is now functionally complete.**
+
+**READ THIS SECTION FIRST.** Everything below §0 (sections 1 onward) was
+written at the end of the Phase-12/publication-cleanup session, before
+Chronos became multi-user. It's preserved as-is (architecture/invariants
+sections are still fully accurate — nothing in this round of work touched
+`core/transitions.py`, the outbox, claiming, leases, or the reaper) but
+its "no auth" / "no frontend yet" framing in places is now stale; §0
+below is the current state.
+
+## 0. Multi-user evolution (this session)
+
+Starting point: everything in §1-§25 below was already true, including
+an existing React frontend (§10-13 describe it as "not started" — that
+was stale even before this session; a single-page frontend already
+existed). This session added, in order, without touching the frozen
+state machine or any distributed-systems invariant:
+
+1. **Auth** (`auth/`, `api/auth_routes.py`, `api/auth_dependency.py`):
+   JWT bearer tokens (`HS256`, `CHRONOS_JWT_SECRET`, no default —
+   `api/config.py`), bcrypt password hashing (`auth/passwords.py`, with a
+   72-byte length cap matching bcrypt's own hard limit — found as a real
+   bug during the Phase 8 review of this session, where a >72-byte
+   password reached `bcrypt.hashpw` unguarded and raised an unhandled
+   `ValueError`/500). `workflows.user_id` (new migration,
+   `db/migrations/0003_users.sql`) ties every workflow to one owner;
+   every workflow/task route checks ownership and 404s (never 403) for
+   another user's workflow. `GET /workflows` (new) lists the caller's
+   own workflows.
+2. **Task types** (`worker/tasks/`): `sleep`, `http_request` (SSRF-guarded,
+   documented DNS-rebinding TOCTOU gap), `python_expression` (whitelist
+   AST walker, not `eval`/`exec`) alongside the original `echo`
+   (`worker/demo_task.py`, untouched). A SQL task type was deliberately
+   not built — see `worker/tasks/__init__.py`'s docstring for why.
+   `GET /task-types` (new) serves this registry's metadata to the
+   frontend.
+3. **Frontend** (`frontend/src/`): added `react-router-dom` and real
+   routes (`/login`, `/register`, `/` dashboard, `/workflows`,
+   `/workflows/new`, `/workflows/:id`) replacing the old single-page
+   "load a workflow by typing its id" UX. `AuthContext` holds the JWT.
+   `DependencyGraph` now reads each task's real `depends_on_ids` (now
+   returned by `GET /workflows/{id}/tasks` — see
+   `db/persistence.py::list_tasks_for_workflow`) instead of a
+   client-session-only approximation.
+4. **Redis limiter wiring**: `worker/__main__.py` now constructs a
+   `TaskTypeLimiter` when `CHRONOS_REDIS_LIMITER_ENABLED=1` is set
+   (`_build_limiter`, unit-tested in isolation in
+   `tests/test_worker_main_wiring.py` without needing a real worker
+   loop). Previously implemented and tested but never wired into any
+   entrypoint.
+5. **Security review pass** (documented in README.md's "Known
+   limitations" and inline docstrings): found and fixed the bcrypt
+   72-byte issue above, and a **login timing side-channel** — the
+   original `user is None or not verify_password(...)` short-circuited
+   `verify_password` (bcrypt, ~100ms) entirely for an unknown email,
+   making "unknown email" measurably faster than "known email, wrong
+   password" despite an identical 401 body. Fixed in
+   `api/auth_routes.py::login` by always calling `verify_password` once
+   on this path (against a fixed dummy hash when there's no real user to
+   check against).
+6. **Demo workflows**: `scripts/seed_demo_workflows.py` creates a linear
+   pipeline, a parallel diamond, and a retry demo through the real HTTP
+   API (never direct DB writes).
+
+Test count: 351/351 (the pinned baseline below) → 418 collected now, all
+additions, nothing removed or weakened. The DB-backed portion was
+verified against a real Postgres instance in the user's own environment
+during this session (not by the agent directly, which had no reliable DB
+access this session — see the session transcript for why); re-run the
+full suite in your own environment before trusting this count blindly,
+per this document's own standing rule (§ "before recommending from
+memory" conventions apply here too).
+
+`core/transitions.py`'s SHA-256 (§12/§25 below) was **not** recomputed
+this session — no edit tool was ever opened against that file; verify it
+yourself if you want the checkpoint re-confirmed.
+
+See `README.md` for the full, up-to-date technical writeup (auth flow,
+task types, Redis wiring, frontend routes) — it was updated in the same
+session as this section and is the more complete reference going
+forward.
 
 ---
 

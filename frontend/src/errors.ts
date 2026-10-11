@@ -13,24 +13,38 @@ export interface DisplayError {
   detail: string;
 }
 
+/** FastAPI's error bodies come in two shapes: a plain `{detail: "..."}`
+ * (raised HTTPException) and a validation `{detail: [{loc, msg, type}]}`
+ * (422). This pulls a short, human sentence out of either without ever
+ * dumping raw JSON at the user. */
+function extractDetail(detail: unknown): string | null {
+  if (typeof detail === "string") return detail;
+  if (detail && typeof detail === "object" && "detail" in detail) {
+    const inner = (detail as { detail: unknown }).detail;
+    if (typeof inner === "string") return inner;
+    if (Array.isArray(inner) && inner.length > 0) {
+      const first = inner[0] as { msg?: string };
+      if (first?.msg) return first.msg.replace(/^Value error,\s*/i, "");
+    }
+  }
+  return null;
+}
+
 export function describeError(err: unknown): DisplayError {
   if (err instanceof ApiError) {
-    if (err.status === 404) {
-      return { title: "Not found", detail: typeof err.detail === "object" ? JSON.stringify(err.detail) : String(err.detail) };
+    if (err.status === 401) {
+      return { title: "Signed out", detail: "Your session has expired — please sign in again." };
     }
-    if (err.status === 400) {
-      return {
-        title: "Request rejected",
-        detail:
-          typeof err.detail === "object" && err.detail !== null && "detail" in (err.detail as object)
-            ? String((err.detail as { detail: unknown }).detail)
-            : JSON.stringify(err.detail),
-      };
+    if (err.status === 404) {
+      return { title: "Not found", detail: extractDetail(err.detail) ?? "That resource doesn't exist." };
+    }
+    if (err.status === 400 || err.status === 422) {
+      return { title: "Couldn't complete that", detail: extractDetail(err.detail) ?? "The request was rejected." };
     }
     if (err.status >= 500) {
-      return { title: "Backend error", detail: `Chronos API returned ${err.status}` };
+      return { title: "Something went wrong", detail: `Chronos ran into a server error (${err.status}). Please try again.` };
     }
-    return { title: `API error ${err.status}`, detail: JSON.stringify(err.detail) };
+    return { title: "Request failed", detail: extractDetail(err.detail) ?? `The API returned ${err.status}.` };
   }
   if (err instanceof TypeError) {
     // fetch() throws a bare TypeError ("Failed to fetch") when the

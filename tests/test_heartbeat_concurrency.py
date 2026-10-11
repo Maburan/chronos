@@ -36,7 +36,7 @@ def _synced_clock():
 
 
 def _make_workflow(db):
-    return persistence.create_workflow(db, name="wf")
+    return persistence.create_workflow(db, name="wf", user_id=db.test_user_id)
 
 
 def _claim_with_short_lease(db, *, worker_id="racer", max_attempts=3):

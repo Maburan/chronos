@@ -56,6 +56,25 @@ class UnknownTaskError(LookupError):
     has no notion of task identity at all."""
 
 
+class CyclicDependencyError(ValueError):
+    """Raised by ``save_workflow_definition`` when the submitted
+    dependency edges contain a cycle among task_definitions.
+
+    Unlike ``task_dependencies`` (execution rows), where an edge can only
+    ever reference an already-existing row (making a real cycle
+    structurally impossible -- see tests/test_api_tasks.py's cycle test),
+    ``task_definitions`` are replaced as a *whole graph* in one
+    transaction: every node and every edge in the submitted graph is new
+    at the same instant, so nothing stops a client from submitting A -> B
+    -> A. This is therefore checked explicitly in Python, before any row
+    is written, rather than relying on a DB constraint."""
+
+
+class EmptyWorkflowDefinitionError(ValueError):
+    """Raised by ``create_workflow_run`` when a workflow currently has no
+    task_definitions -- there is nothing meaningful to materialize/run."""
+
+
 @dataclass(frozen=True)
 class PersistResult:
     """Outcome of a persisted single-task transition.
@@ -126,13 +145,23 @@ def _insert_ready_outbox_event(cur, row: dict) -> None:
     )
 
 
-def create_workflow(pool: ConnectionPool, *, name: str) -> dict:
+def create_workflow(pool: ConnectionPool, *, name: str, user_id: int) -> dict:
     with pool.connection() as conn:
         with conn.transaction():
             with conn.cursor() as cur:
-                cur.execute(queries.CREATE_WORKFLOW, {"name": name})
+                cur.execute(queries.CREATE_WORKFLOW, {"name": name, "user_id": user_id})
                 row = cur.fetchone()
     return row
+
+
+def list_workflows_for_user(pool: ConnectionPool, *, user_id: int) -> list[dict]:
+    """A user's own workflows, most-recently-created first. Backs ``GET
+    /workflows`` -- see ``queries.SELECT_WORKFLOWS_FOR_USER``."""
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(queries.SELECT_WORKFLOWS_FOR_USER, {"user_id": user_id})
+            rows = cur.fetchall()
+    return [dict(row) for row in rows]
 
 
 def create_task(
@@ -171,6 +200,11 @@ def create_task(
                         "state": instance.state.value,
                         "max_attempts": instance.max_attempts,
                         "payload": Jsonb(payload) if payload is not None else None,
+                        # Direct task creation is never part of a run --
+                        # see db/models.py's TaskRecord docstring on these
+                        # two columns.
+                        "workflow_run_id": None,
+                        "task_definition_id": None,
                     },
                 )
                 row = cur.fetchone()
@@ -187,7 +221,7 @@ def create_task(
                 # later statement in this transaction can still fail.
                 if instance.state == TaskState.READY:
                     _insert_ready_outbox_event(cur, row)
-    return row_to_task_record(row)
+    return row_to_task_record(row, depends_on_ids=tuple(depends_on_ids))
 
 
 # ---------------------------------------------------------------------------
@@ -587,22 +621,39 @@ def get_task(pool: ConnectionPool, *, task_id: int) -> Optional[TaskRecord]:
         with conn.cursor() as cur:
             cur.execute(queries.SELECT_TASK_BY_ID, {"task_id": task_id})
             row = cur.fetchone()
-    if row is None:
-        return None
-    return row_to_task_record(row)
+            if row is None:
+                return None
+            cur.execute(queries.SELECT_DEPENDENCIES_FOR_TASK, {"task_id": task_id})
+            dep_rows = cur.fetchall()
+    return row_to_task_record(
+        row, depends_on_ids=tuple(r["depends_on_task_id"] for r in dep_rows)
+    )
 
 
 def list_tasks_for_workflow(pool: ConnectionPool, *, workflow_id: int) -> list[TaskRecord]:
-    """Every task belonging to ``workflow_id``, oldest-created first.
-    Returns an empty list both when the workflow has no tasks and when
-    the workflow itself doesn't exist -- callers that need to distinguish
-    "empty workflow" from "no such workflow" should call ``get_workflow``
-    first, same as the API layer does (see api/routes.py)."""
+    """Every task belonging to ``workflow_id``, oldest-created first, each
+    with its ``depends_on_ids`` populated. Returns an empty list both when
+    the workflow has no tasks and when the workflow itself doesn't exist
+    -- callers that need to distinguish "empty workflow" from "no such
+    workflow" should call ``get_workflow`` first, same as the API layer
+    does (see api/routes.py)."""
     with pool.connection() as conn:
         with conn.cursor() as cur:
             cur.execute(queries.SELECT_TASKS_FOR_WORKFLOW, {"workflow_id": workflow_id})
             rows = cur.fetchall()
-    return [row_to_task_record(row) for row in rows]
+            cur.execute(
+                queries.SELECT_DEPENDENCIES_FOR_WORKFLOW, {"workflow_id": workflow_id}
+            )
+            edge_rows = cur.fetchall()
+
+    deps_by_task: dict[int, list[int]] = {}
+    for edge in edge_rows:
+        deps_by_task.setdefault(edge["task_id"], []).append(edge["depends_on_task_id"])
+
+    return [
+        row_to_task_record(row, depends_on_ids=tuple(deps_by_task.get(row["id"], ())))
+        for row in rows
+    ]
 
 
 def get_workflow_task_state_counts(pool: ConnectionPool, *, workflow_id: int) -> dict:
@@ -624,6 +675,402 @@ def get_workflow_task_state_counts(pool: ConnectionPool, *, workflow_id: int) ->
             cur.execute(
                 queries.SELECT_WORKFLOW_TASK_STATE_COUNTS, {"workflow_id": workflow_id}
             )
+            row = cur.fetchone()
+    return dict(row)
+
+
+def get_backlog_counts(pool: ConnectionPool) -> dict[str, dict[str, int]]:
+    """Per-task-type live workload for the autoscaler:
+    ``{task_type: {"backlog": <READY count>, "running": <RUNNING count>}}``.
+
+    A plain, unlocked read (``queries.SELECT_BACKLOG_COUNTS_BY_TASK_TYPE``)
+    -- the same non-blocking convention as ``get_workflow_task_state_counts``
+    / ``get_task``. Only task types with at least one non-terminal
+    (READY/RUNNING) row appear; a type with no such rows is simply absent
+    from the result, and the autoscaler treats a missing type as backlog 0
+    (see autoscaler/autoscaler.py). This is a read-only workload signal --
+    it never writes task state and is not a second source of truth; see the
+    query's own comment in db/queries.py."""
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(queries.SELECT_BACKLOG_COUNTS_BY_TASK_TYPE)
+            rows = cur.fetchall()
+    return {
+        row["task_type"]: {"backlog": row["backlog"], "running": row["running"]}
+        for row in rows
+    }
+
+
+# ---------------------------------------------------------------------------
+# workflow definitions (Builder design-time graph)
+# ---------------------------------------------------------------------------
+
+
+def _validate_no_cycles(client_ids: set, edges: list[tuple[str, str]]) -> None:
+    """DFS cycle check over the submitted client-id graph (small, in-memory
+    -- a workflow definition's node count is never large enough to justify
+    anything fancier). ``edges`` are ``(task_client_id,
+    depends_on_client_id)`` pairs. See ``CyclicDependencyError`` for why
+    this can't be left to a DB constraint the way ``task_dependencies``
+    can."""
+    deps: dict[str, list[str]] = {cid: [] for cid in client_ids}
+    for task_cid, dep_cid in edges:
+        deps[task_cid].append(dep_cid)
+
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color = {cid: WHITE for cid in client_ids}
+
+    def visit(cid: str) -> None:
+        color[cid] = GRAY
+        for dep_cid in deps[cid]:
+            if color[dep_cid] == GRAY:
+                raise CyclicDependencyError(
+                    f"dependency cycle detected involving task '{cid}'"
+                )
+            if color[dep_cid] == WHITE:
+                visit(dep_cid)
+        color[cid] = BLACK
+
+    for cid in client_ids:
+        if color[cid] == WHITE:
+            visit(cid)
+
+
+def save_workflow_definition(
+    pool: ConnectionPool,
+    *,
+    workflow_id: int,
+    tasks: Sequence[dict],
+    dependencies: Sequence[dict],
+) -> list[dict]:
+    """Whole-graph replace of a workflow's task_definitions/
+    task_definition_dependencies, atomically: the existing graph is
+    deleted (CASCADE also removes its dependency edges) and the submitted
+    one inserted, in one transaction -- a mid-save failure never leaves a
+    half-replaced definition behind.
+
+    This never touches ``tasks``/``task_dependencies`` or the outbox --
+    Save is purely a design-time write; nothing here is ever dispatched to
+    a worker (see ``create_workflow_run`` for the one operation that does
+    that).
+
+    ``tasks`` items: ``{"client_id": str, "name": str, "task_type": str,
+    "max_attempts": int, "payload": Optional[dict], "position_x":
+    Optional[float], "position_y": Optional[float]}``. ``client_id`` is a
+    caller-chosen string used only to resolve ``dependencies`` edges
+    within this one call (e.g. a frontend's in-memory node id for a node
+    that has no database id yet) -- it is never persisted; every later
+    read/materialization uses the DB-assigned integer id returned here.
+
+    ``dependencies`` items: ``{"task_client_id": str,
+    "depends_on_client_id": str, "branch": Optional[str]}``. ``branch`` is
+    stored as-is but not yet interpreted by anything -- reserved for the
+    isolated If/Else branching phase; every edge here behaves as a plain
+    AND-dependency once materialized, exactly like ``task_dependencies``
+    today.
+
+    Raises ``CyclicDependencyError`` for a cyclic graph, ``KeyError`` for
+    an edge referencing an unknown ``client_id``, or ``ValueError`` for a
+    duplicate ``client_id`` / a self-dependency -- all checked before any
+    row is written.
+    """
+    client_ids = {t["client_id"] for t in tasks}
+    if len(client_ids) != len(tasks):
+        raise ValueError("duplicate client_id in submitted task definitions")
+
+    edge_pairs: list[tuple[str, str]] = []
+    for dep in dependencies:
+        task_cid = dep["task_client_id"]
+        dep_cid = dep["depends_on_client_id"]
+        if task_cid not in client_ids or dep_cid not in client_ids:
+            raise KeyError(
+                f"dependency references unknown client_id: {task_cid!r} -> {dep_cid!r}"
+            )
+        if task_cid == dep_cid:
+            raise ValueError(f"task '{task_cid}' cannot depend on itself")
+        edge_pairs.append((task_cid, dep_cid))
+
+    _validate_no_cycles(client_ids, edge_pairs)
+
+    with pool.connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    queries.DELETE_TASK_DEFINITIONS_FOR_WORKFLOW,
+                    {"workflow_id": workflow_id},
+                )
+
+                id_by_client_id: dict[str, int] = {}
+                rows_by_client_id: dict[str, dict] = {}
+                for t in tasks:
+                    cur.execute(
+                        queries.INSERT_TASK_DEFINITION,
+                        {
+                            "workflow_id": workflow_id,
+                            "name": t["name"],
+                            "task_type": t["task_type"],
+                            "max_attempts": t.get("max_attempts", 1),
+                            "payload": Jsonb(t["payload"])
+                            if t.get("payload") is not None
+                            else None,
+                            "position_x": t.get("position_x"),
+                            "position_y": t.get("position_y"),
+                        },
+                    )
+                    row = cur.fetchone()
+                    id_by_client_id[t["client_id"]] = row["id"]
+                    rows_by_client_id[t["client_id"]] = row
+
+                deps_by_client_id: dict[str, list[int]] = {cid: [] for cid in client_ids}
+                for dep in dependencies:
+                    task_cid = dep["task_client_id"]
+                    dep_cid = dep["depends_on_client_id"]
+                    cur.execute(
+                        queries.INSERT_TASK_DEFINITION_DEPENDENCY,
+                        {
+                            "task_definition_id": id_by_client_id[task_cid],
+                            "depends_on_task_definition_id": id_by_client_id[dep_cid],
+                            "branch": dep.get("branch"),
+                        },
+                    )
+                    deps_by_client_id[task_cid].append(id_by_client_id[dep_cid])
+
+    return [
+        {**dict(rows_by_client_id[cid]), "depends_on_ids": tuple(deps_by_client_id[cid])}
+        for cid in client_ids
+    ]
+
+
+def get_workflow_definition(pool: ConnectionPool, *, workflow_id: int) -> list[dict]:
+    """Every task_definition belonging to ``workflow_id``, each with its
+    ``depends_on_ids`` populated -- the Builder's load-into-canvas read.
+    Mirrors ``list_tasks_for_workflow``'s shape and existence convention
+    (empty list both for "no task_definitions yet" and "workflow doesn't
+    exist")."""
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                queries.SELECT_TASK_DEFINITIONS_FOR_WORKFLOW, {"workflow_id": workflow_id}
+            )
+            rows = cur.fetchall()
+            cur.execute(
+                queries.SELECT_TASK_DEFINITION_DEPENDENCIES_FOR_WORKFLOW,
+                {"workflow_id": workflow_id},
+            )
+            edge_rows = cur.fetchall()
+
+    deps_by_task: dict[int, list[int]] = {}
+    for edge in edge_rows:
+        deps_by_task.setdefault(edge["task_definition_id"], []).append(
+            edge["depends_on_task_definition_id"]
+        )
+
+    return [
+        {**dict(row), "depends_on_ids": tuple(deps_by_task.get(row["id"], ()))} for row in rows
+    ]
+
+
+# ---------------------------------------------------------------------------
+# workflow runs (materialized executions of a workflow definition)
+# ---------------------------------------------------------------------------
+
+
+def create_workflow_run(
+    pool: ConnectionPool, *, workflow_id: int, triggered_by_user_id: int
+) -> dict:
+    """Materializes the workflow's current task_definitions/
+    task_definition_dependencies into a brand-new set of real, executable
+    ``tasks``/``task_dependencies`` rows, in exactly one PostgreSQL
+    transaction: the ``workflow_runs`` row, every materialized task row,
+    every materialized dependency edge, and every TASK_READY outbox event
+    for a zero-dependency task all commit together, or none do. There is
+    no state a concurrent reader (a worker, the outbox relay, an HTTP
+    caller) could ever observe midway through -- either the run doesn't
+    exist yet, or it exists complete and immediately dispatchable, exactly
+    like every other outbox-producing write in this module (see the module
+    docstring's "no committed READY task without its event" invariant,
+    which this function extends across an entire run's worth of tasks
+    instead of just one).
+
+    This is the one and only place a "Run" action does real work:
+    ``save_workflow_definition`` never creates a single ``tasks`` row, and
+    this function never mutates ``task_definitions`` -- reading them is
+    the only thing it does with them. The exact graph and per-task
+    configuration read here is captured verbatim into
+    ``workflow_runs.definition_snapshot`` *before* materialization, so
+    this run's history is fixed at this moment even if ``task_definitions``
+    is edited or a row is deleted afterward -- see db/migrations/
+    0004_workflow_definitions_and_runs.sql's module docstring for the full
+    immutability argument.
+
+    Raises ``EmptyWorkflowDefinitionError`` if the workflow currently has
+    no task_definitions.
+    """
+    with pool.connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    queries.SELECT_TASK_DEFINITIONS_FOR_WORKFLOW,
+                    {"workflow_id": workflow_id},
+                )
+                definition_rows = cur.fetchall()
+                if not definition_rows:
+                    raise EmptyWorkflowDefinitionError(
+                        f"workflow {workflow_id} has no task definitions to run"
+                    )
+
+                cur.execute(
+                    queries.SELECT_TASK_DEFINITION_DEPENDENCIES_FOR_WORKFLOW,
+                    {"workflow_id": workflow_id},
+                )
+                dependency_rows = cur.fetchall()
+
+                deps_by_definition: dict[int, list[int]] = {}
+                for edge in dependency_rows:
+                    deps_by_definition.setdefault(edge["task_definition_id"], []).append(
+                        edge["depends_on_task_definition_id"]
+                    )
+
+                # Captured now, before a single tasks row exists for this
+                # run -- this dict (not task_definitions) is what makes
+                # the run's history immutable to later definition edits.
+                snapshot = {
+                    "task_definitions": [
+                        {
+                            "id": row["id"],
+                            "name": row["name"],
+                            "task_type": row["task_type"],
+                            "max_attempts": row["max_attempts"],
+                            "payload": row["payload"],
+                            "depends_on_task_definition_ids": deps_by_definition.get(
+                                row["id"], []
+                            ),
+                        }
+                        for row in definition_rows
+                    ],
+                    "dependencies": [
+                        {
+                            "task_definition_id": edge["task_definition_id"],
+                            "depends_on_task_definition_id": edge[
+                                "depends_on_task_definition_id"
+                            ],
+                            "branch": edge["branch"],
+                        }
+                        for edge in dependency_rows
+                    ],
+                }
+
+                cur.execute(
+                    queries.INSERT_WORKFLOW_RUN,
+                    {
+                        "workflow_id": workflow_id,
+                        "triggered_by_user_id": triggered_by_user_id,
+                        "definition_snapshot": Jsonb(snapshot),
+                    },
+                )
+                run_row = cur.fetchone()
+                run_id = run_row["id"]
+
+                task_id_by_definition_id: dict[int, int] = {}
+                task_rows_by_definition_id: dict[int, dict] = {}
+                for def_row in definition_rows:
+                    def_id = def_row["id"]
+                    instance = transitions.create_task(
+                        has_dependencies=bool(deps_by_definition.get(def_id)),
+                        max_attempts=def_row["max_attempts"],
+                    )
+                    cur.execute(
+                        queries.INSERT_TASK,
+                        {
+                            "workflow_id": workflow_id,
+                            "name": def_row["name"],
+                            "task_type": def_row["task_type"],
+                            "state": instance.state.value,
+                            "max_attempts": instance.max_attempts,
+                            "payload": Jsonb(def_row["payload"])
+                            if def_row["payload"] is not None
+                            else None,
+                            "workflow_run_id": run_id,
+                            "task_definition_id": def_id,
+                        },
+                    )
+                    task_row = cur.fetchone()
+                    task_id_by_definition_id[def_id] = task_row["id"]
+                    task_rows_by_definition_id[def_id] = task_row
+
+                # Dependency edges only inserted once every task row for
+                # this run exists, so a forward reference (task A, created
+                # first, depending on task B, created after) never trips
+                # the tasks_dependencies FK.
+                for def_id, dep_def_ids in deps_by_definition.items():
+                    for dep_def_id in dep_def_ids:
+                        cur.execute(
+                            queries.INSERT_TASK_DEPENDENCY,
+                            {
+                                "task_id": task_id_by_definition_id[def_id],
+                                "depends_on_task_id": task_id_by_definition_id[dep_def_id],
+                            },
+                        )
+
+                for task_row in task_rows_by_definition_id.values():
+                    if task_row["state"] == TaskState.READY.value:
+                        _insert_ready_outbox_event(cur, task_row)
+
+    return dict(run_row)
+
+
+def list_workflow_runs(pool: ConnectionPool, *, workflow_id: int) -> list[dict]:
+    """Every run of ``workflow_id``, most-recently-created first."""
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                queries.SELECT_WORKFLOW_RUNS_FOR_WORKFLOW, {"workflow_id": workflow_id}
+            )
+            rows = cur.fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_workflow_run(pool: ConnectionPool, *, run_id: int) -> Optional[dict]:
+    """A plain, unlocked read of one run's row (including its immutable
+    ``definition_snapshot``). Returns ``None`` if no run with this id
+    exists."""
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(queries.SELECT_WORKFLOW_RUN_BY_ID, {"run_id": run_id})
+            row = cur.fetchone()
+    return dict(row) if row is not None else None
+
+
+def list_tasks_for_run(pool: ConnectionPool, *, run_id: int) -> list[TaskRecord]:
+    """Every task materialized for ``run_id``, each with its
+    ``depends_on_ids`` populated -- the run-scoped equivalent of
+    ``list_tasks_for_workflow``, needed once a workflow can be run more
+    than once (a plain workflow_id-scoped read would otherwise mix
+    together every run's tasks)."""
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(queries.SELECT_TASKS_FOR_RUN, {"run_id": run_id})
+            rows = cur.fetchall()
+            cur.execute(queries.SELECT_DEPENDENCIES_FOR_RUN, {"run_id": run_id})
+            edge_rows = cur.fetchall()
+
+    deps_by_task: dict[int, list[int]] = {}
+    for edge in edge_rows:
+        deps_by_task.setdefault(edge["task_id"], []).append(edge["depends_on_task_id"])
+
+    return [
+        row_to_task_record(row, depends_on_ids=tuple(deps_by_task.get(row["id"], ())))
+        for row in rows
+    ]
+
+
+def get_run_task_state_counts(pool: ConnectionPool, *, run_id: int) -> dict:
+    """Per-state task counts scoped to one run -- the run-scoped equivalent
+    of ``get_workflow_task_state_counts``, computed the same way (a single
+    PostgreSQL aggregation, never fetched-and-counted in Python)."""
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(queries.SELECT_RUN_TASK_STATE_COUNTS, {"run_id": run_id})
             row = cur.fetchone()
     return dict(row)
 

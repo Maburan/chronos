@@ -164,6 +164,32 @@ def test_create_task_with_invalid_dependency_returns_400_and_rolls_back(api_clie
     assert rows == []
 
 
+def test_task_creation_cannot_form_a_dependency_cycle(api_client):
+    """A workflow's DAG is acyclic by construction, not by any explicit
+    cycle-detection check: depends_on_ids may only name tasks that
+    already exist (enforced by the tasks.id foreign key on
+    task_dependencies -- see db/migrations/0001_init.sql), and there is
+    no endpoint to add a dependency edge to an already-created task after
+    the fact. A task can therefore never depend on a task created after
+    it, which is exactly what a cycle would require. This test pins that
+    structural guarantee rather than any new validation logic."""
+    wf = _create_workflow(api_client)
+    a = api_client.post(
+        f"/workflows/{wf['id']}/tasks", json={"name": "a", "task_type": "noop"}
+    ).json()
+
+    # b depends on a (fine) -- a "future" id one greater than any task
+    # created so far stands in for "the task that would close the cycle
+    # back to a hasn't been created yet, and never can be after the fact".
+    future_id = a["id"] + 1000
+    response = api_client.post(
+        f"/workflows/{wf['id']}/tasks",
+        json={"name": "b", "task_type": "noop", "depends_on_ids": [a["id"], future_id]},
+    )
+
+    assert response.status_code == 400
+
+
 # ---------------------------------------------------------------------------
 # GET reflects live state, not a cached/stale view
 # ---------------------------------------------------------------------------

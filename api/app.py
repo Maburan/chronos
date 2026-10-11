@@ -17,6 +17,7 @@ from typing import AsyncIterator, Optional
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from api.auth_routes import router as auth_router
 from api.config import ApiConfig
 from api.health import health_router
 from api.routes import router
@@ -37,6 +38,10 @@ def create_app(config: Optional[ApiConfig] = None) -> FastAPI:
             max_size=resolved_config.pool_max_size,
         )
         app.state.pool = pool
+        # Read by api/auth_dependency.py's get_current_user (JWT
+        # secret/expiry) -- the only other piece of ApiConfig a route
+        # needs beyond the pool.
+        app.state.config = resolved_config
         try:
             yield
         finally:
@@ -54,6 +59,7 @@ def create_app(config: Optional[ApiConfig] = None) -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    app.include_router(auth_router)
     app.include_router(router)
     app.include_router(health_router)
     return app

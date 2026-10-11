@@ -28,7 +28,7 @@ LEASE = timedelta(minutes=5)
 
 
 def _make_workflow(db):
-    return persistence.create_workflow(db, name="wf")
+    return persistence.create_workflow(db, name="wf", user_id=db.test_user_id)
 
 
 def _outbox_rows_for_task(db, task_id: int) -> list[dict]:
@@ -263,7 +263,7 @@ def test_fan_in_dependency_completion_produces_no_premature_event(db):
 
 
 def test_concurrent_fan_in_completion_does_not_create_duplicate_outbox_rows(db, db_dsn):
-    wf = persistence.create_workflow(db, name="fan-in-outbox-wf")
+    wf = persistence.create_workflow(db, name="fan-in-outbox-wf", user_id=db.test_user_id)
     x = persistence.create_task(db, workflow_id=wf["id"], name="x", task_type="noop")
     y = persistence.create_task(db, workflow_id=wf["id"], name="y", task_type="noop")
     z = persistence.create_task(
@@ -519,7 +519,7 @@ def test_applied_false_transition_creates_no_outbox_event(db):
 
 
 def test_concurrent_retries_preserve_one_event_per_ready_transition(db, db_dsn):
-    wf = persistence.create_workflow(db, name="retry-outbox-wf")
+    wf = persistence.create_workflow(db, name="retry-outbox-wf", user_id=db.test_user_id)
     max_attempts = 3
     task = persistence.create_task(
         db, workflow_id=wf["id"], name="t1", task_type="noop", max_attempts=max_attempts
@@ -566,7 +566,7 @@ def test_no_double_claim_implies_no_duplicate_creation_events(db, db_dsn):
     # Every task created here starts READY (zero deps) -- exactly one
     # outbox row per task must exist regardless of concurrent claiming
     # racing against the (already-committed, single-transaction) creation.
-    wf = persistence.create_workflow(db, name="no-dup-outbox-wf")
+    wf = persistence.create_workflow(db, name="no-dup-outbox-wf", user_id=db.test_user_id)
     n_tasks = 20
     ids = [
         persistence.create_task(db, workflow_id=wf["id"], name=f"t{i}", task_type="noop").id

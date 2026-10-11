@@ -30,6 +30,20 @@ class TaskRecord:
     created_at: datetime
     updated_at: datetime
     instance: TaskInstance
+    # Not a tasks-table column -- populated separately from
+    # task_dependencies by whoever builds this record (see
+    # db.persistence.list_tasks_for_workflow /
+    # db.persistence.create_task). Defaults empty so every existing
+    # construction site that doesn't pass it keeps working unchanged.
+    depends_on_ids: tuple[int, ...] = ()
+    # Both None for a task created directly (every pre-Definition/Run
+    # caller, and every existing test) -- only tasks materialized by
+    # persistence.create_workflow_run populate them. See db/migrations/
+    # 0004_workflow_definitions_and_runs.sql's module docstring: neither
+    # column is the source of truth for what a run executed (the run's own
+    # definition_snapshot is) -- these are traceability links only.
+    workflow_run_id: Optional[int] = None
+    task_definition_id: Optional[int] = None
 
 
 def row_to_task_instance(row: Mapping[str, Any]) -> TaskInstance:
@@ -49,7 +63,9 @@ def row_to_task_instance(row: Mapping[str, Any]) -> TaskInstance:
     )
 
 
-def row_to_task_record(row: Mapping[str, Any]) -> TaskRecord:
+def row_to_task_record(
+    row: Mapping[str, Any], *, depends_on_ids: tuple[int, ...] = ()
+) -> TaskRecord:
     return TaskRecord(
         id=row["id"],
         workflow_id=row["workflow_id"],
@@ -59,6 +75,9 @@ def row_to_task_record(row: Mapping[str, Any]) -> TaskRecord:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         instance=row_to_task_instance(row),
+        depends_on_ids=depends_on_ids,
+        workflow_run_id=row.get("workflow_run_id"),
+        task_definition_id=row.get("task_definition_id"),
     )
 
 

@@ -29,7 +29,7 @@ class _FakeRecord:
 
 
 def _make_workflow(db):
-    return persistence.create_workflow(db, name="wf")
+    return persistence.create_workflow(db, name="wf", user_id=db.test_user_id)
 
 
 def _claim(db, task_id, worker_id="w1"):

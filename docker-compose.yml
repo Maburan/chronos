@@ -1,0 +1,389 @@
+# Chronos local development stack (Phase 5).
+#
+#   cp .env.example .env      # first time only
+#   docker compose up --build
+#
+# Orchestrates the EXISTING distributed processes as separate containers
+# -- nothing here merges API/worker/relay/reaper into one process. Each
+# backend service (migrate/api/relay/reaper/worker-*) runs the same image
+# (built from the root Dockerfile) with a different `command:`, exactly
+# mirroring how each already runs as `python -m <package>` outside Docker.
+#
+# See HANDOVER.md's Phase 5 section and README.md's "Docker Compose
+# (recommended)" section for the full writeup, including why the
+# `migrate` service exists (a whole prior session was spent diagnosing a
+# missing-migration bug that this service makes structurally impossible
+# to hit again).
+
+services:
+  # -------------------------------------------------------------------
+  # Infrastructure
+  # -------------------------------------------------------------------
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${CHRONOS_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${CHRONOS_POSTGRES_PASSWORD}
+      POSTGRES_DB: ${CHRONOS_POSTGRES_DB}
+    ports:
+      - "${CHRONOS_POSTGRES_HOST_PORT}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${CHRONOS_RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${CHRONOS_RABBITMQ_PASSWORD}
+    ports:
+      - "${CHRONOS_RABBITMQ_HOST_PORT}:5672"
+      - "${CHRONOS_RABBITMQ_MANAGEMENT_HOST_PORT}:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "${CHRONOS_REDIS_HOST_PORT}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    # Deliberately no volume -- the limiter is fail-open, ephemeral
+    # admission control (see redis_limiter/config.py's module docstring),
+    # never a source of truth. Losing it on restart is a non-event.
+
+  # -------------------------------------------------------------------
+  # Schema bootstrap -- runs once, must succeed before any backend
+  # service starts. This is the fix for the exact bug this project's
+  # last session spent hours chasing: a backend process starting against
+  # a database that's missing a migration.
+  # -------------------------------------------------------------------
+
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python -m db
+    restart: "no"
+    env_file:
+      - .env
+    environment:
+      CHRONOS_DATABASE_URL: postgresql://${CHRONOS_POSTGRES_USER}:${CHRONOS_POSTGRES_PASSWORD}@postgres:5432/${CHRONOS_POSTGRES_DB}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # -------------------------------------------------------------------
+  # Backend services -- each its own container, its own process, exactly
+  # as designed. Source is bind-mounted read-write for hot reload; only
+  # the API's `--reload` flag actually watches for changes, since
+  # relay/reaper/worker are plain blocking loops with no reload
+  # machinery of their own (see README.md's Phase 5 section for how to
+  # pick up code changes in those: `docker compose restart <service>`).
+  # -------------------------------------------------------------------
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: uvicorn api.app:create_app --factory --host 0.0.0.0 --port 8000 --reload
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      CHRONOS_DATABASE_URL: postgresql://${CHRONOS_POSTGRES_USER}:${CHRONOS_POSTGRES_PASSWORD}@postgres:5432/${CHRONOS_POSTGRES_DB}
+    volumes:
+      - .:/app
+    ports:
+      - "${CHRONOS_API_HOST_PORT}:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  relay:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python -m relay
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      CHRONOS_DATABASE_URL: postgresql://${CHRONOS_POSTGRES_USER}:${CHRONOS_POSTGRES_PASSWORD}@postgres:5432/${CHRONOS_POSTGRES_DB}
+      CHRONOS_RABBITMQ_URL: amqp://${CHRONOS_RABBITMQ_USER}:${CHRONOS_RABBITMQ_PASSWORD}@rabbitmq:5672/
+    volumes:
+      - .:/app
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  reaper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python -m reaper
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      CHRONOS_DATABASE_URL: postgresql://${CHRONOS_POSTGRES_USER}:${CHRONOS_POSTGRES_PASSWORD}@postgres:5432/${CHRONOS_POSTGRES_DB}
+    volumes:
+      - .:/app
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+
+  # -------------------------------------------------------------------
+  # Workers -- one logical service per registered task type (worker/tasks/
+  # __init__.py's TASK_TYPE_REGISTRY), each pinned to its own task-type
+  # queue via CHRONOS_WORKER_TASK_TYPE.
+  #
+  # HORIZONTAL SCALING: each of these services may be run with N replicas,
+  # all consuming the SAME task-type queue -- the model is
+  # `task type -> queue -> N worker instances`, never a queue per replica.
+  #
+  #   docker compose up --build --scale worker-echo=3
+  #
+  # gives three independent echo containers on the one echo queue. This
+  # works because CHRONOS_WORKER_ID is deliberately NOT set here: with it
+  # unset, mq.config.WorkerConfig derives a unique, lifetime-stable id per
+  # container as `worker-<task_type>-<hostname>` (the hostname is each
+  # container's own id -- see mq.config.derive_worker_id). Setting a
+  # single static CHRONOS_WORKER_ID here instead would make every replica
+  # collide on one lease owner and break heartbeat/reaper fencing. To pin
+  # an explicit id for a single-replica deployment, set CHRONOS_WORKER_ID
+  # on that service (it still takes precedence).
+  # -------------------------------------------------------------------
+
+  worker-echo:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python -m worker
+    restart: unless-stopped
+    # Graceful scale-down: on `docker compose --scale <this>=N` (down) or
+    # `down`, Compose sends SIGTERM and waits this long before SIGKILL. The
+    # worker handles SIGTERM by letting its current run_once() finish
+    # (claim->execute->report) and then exiting, so an in-flight task that
+    # completes within the window is reported normally rather than
+    # abandoned. A task that outlives the window is hard-killed and left
+    # RUNNING for the Reaper to reclaim -- the existing, tested
+    # crash-recovery path. Either way no task is lost or run twice.
+    stop_grace_period: 30s
+    env_file:
+      - .env
+    environment:
+      CHRONOS_DATABASE_URL: postgresql://${CHRONOS_POSTGRES_USER}:${CHRONOS_POSTGRES_PASSWORD}@postgres:5432/${CHRONOS_POSTGRES_DB}
+      CHRONOS_RABBITMQ_URL: amqp://${CHRONOS_RABBITMQ_USER}:${CHRONOS_RABBITMQ_PASSWORD}@rabbitmq:5672/
+      CHRONOS_WORKER_TASK_TYPE: echo
+      CHRONOS_REDIS_URL: redis://redis:6379/0
+    # No source bind-mount here (unlike api/relay/reaper). Workers run the
+    # code baked into the image (Dockerfile's COPY . .) so that a replica
+    # created by the autoscaler -- which runs `docker compose up --scale`
+    # from INSIDE a container, where a relative `.:/app` host mount would
+    # NOT resolve to this source tree -- still has the full application and
+    # can consume from the queue. Update worker code with:
+    #   docker compose build worker-echo && docker compose up -d worker-echo
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  worker-sleep:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python -m worker
+    restart: unless-stopped
+    # Graceful scale-down: on `docker compose --scale <this>=N` (down) or
+    # `down`, Compose sends SIGTERM and waits this long before SIGKILL. The
+    # worker handles SIGTERM by letting its current run_once() finish
+    # (claim->execute->report) and then exiting, so an in-flight task that
+    # completes within the window is reported normally rather than
+    # abandoned. A task that outlives the window is hard-killed and left
+    # RUNNING for the Reaper to reclaim -- the existing, tested
+    # crash-recovery path. Either way no task is lost or run twice.
+    stop_grace_period: 30s
+    env_file:
+      - .env
+    environment:
+      CHRONOS_DATABASE_URL: postgresql://${CHRONOS_POSTGRES_USER}:${CHRONOS_POSTGRES_PASSWORD}@postgres:5432/${CHRONOS_POSTGRES_DB}
+      CHRONOS_RABBITMQ_URL: amqp://${CHRONOS_RABBITMQ_USER}:${CHRONOS_RABBITMQ_PASSWORD}@rabbitmq:5672/
+      CHRONOS_WORKER_TASK_TYPE: sleep
+      CHRONOS_REDIS_URL: redis://redis:6379/0
+    # No source bind-mount -- see worker-echo's note (workers run baked-in
+    # image code so autoscaler-created replicas have the full application).
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  worker-http_request:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python -m worker
+    restart: unless-stopped
+    # Graceful scale-down: on `docker compose --scale <this>=N` (down) or
+    # `down`, Compose sends SIGTERM and waits this long before SIGKILL. The
+    # worker handles SIGTERM by letting its current run_once() finish
+    # (claim->execute->report) and then exiting, so an in-flight task that
+    # completes within the window is reported normally rather than
+    # abandoned. A task that outlives the window is hard-killed and left
+    # RUNNING for the Reaper to reclaim -- the existing, tested
+    # crash-recovery path. Either way no task is lost or run twice.
+    stop_grace_period: 30s
+    env_file:
+      - .env
+    environment:
+      CHRONOS_DATABASE_URL: postgresql://${CHRONOS_POSTGRES_USER}:${CHRONOS_POSTGRES_PASSWORD}@postgres:5432/${CHRONOS_POSTGRES_DB}
+      CHRONOS_RABBITMQ_URL: amqp://${CHRONOS_RABBITMQ_USER}:${CHRONOS_RABBITMQ_PASSWORD}@rabbitmq:5672/
+      CHRONOS_WORKER_TASK_TYPE: http_request
+      CHRONOS_REDIS_URL: redis://redis:6379/0
+    # No source bind-mount -- see worker-echo's note (workers run baked-in
+    # image code so autoscaler-created replicas have the full application).
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  worker-python_expression:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python -m worker
+    restart: unless-stopped
+    # Graceful scale-down: on `docker compose --scale <this>=N` (down) or
+    # `down`, Compose sends SIGTERM and waits this long before SIGKILL. The
+    # worker handles SIGTERM by letting its current run_once() finish
+    # (claim->execute->report) and then exiting, so an in-flight task that
+    # completes within the window is reported normally rather than
+    # abandoned. A task that outlives the window is hard-killed and left
+    # RUNNING for the Reaper to reclaim -- the existing, tested
+    # crash-recovery path. Either way no task is lost or run twice.
+    stop_grace_period: 30s
+    env_file:
+      - .env
+    environment:
+      CHRONOS_DATABASE_URL: postgresql://${CHRONOS_POSTGRES_USER}:${CHRONOS_POSTGRES_PASSWORD}@postgres:5432/${CHRONOS_POSTGRES_DB}
+      CHRONOS_RABBITMQ_URL: amqp://${CHRONOS_RABBITMQ_USER}:${CHRONOS_RABBITMQ_PASSWORD}@rabbitmq:5672/
+      CHRONOS_WORKER_TASK_TYPE: python_expression
+      CHRONOS_REDIS_URL: redis://redis:6379/0
+    # No source bind-mount -- see worker-echo's note (workers run baked-in
+    # image code so autoscaler-created replicas have the full application).
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  # -------------------------------------------------------------------
+  # Autoscaler -- observes per-task-type backlog (READY tasks, from
+  # PostgreSQL, the source of truth) and adjusts each worker service's
+  # replica count via the Compose CLI. This is the ONLY service built from
+  # autoscaler/Dockerfile (base image + docker CLI + compose plugin) and
+  # the ONLY one that mounts the Docker socket, because it is the only one
+  # that needs to talk to the daemon.
+  #
+  # It scales the SAME running project it belongs to (auto-detected from
+  # its own compose-project label), calling:
+  #   docker compose up -d --no-deps --no-recreate --scale worker-<type>=N worker-<type>
+  # so scaled-up replicas get no CHRONOS_WORKER_ID and derive their own
+  # unique worker-<type>-<hostname> identity (see mq.config.derive_worker_id).
+  #
+  # Opt-in via CHRONOS_AUTOSCALER_ENABLED (see .env / .env.example). All
+  # tuning (interval, min/max, stabilization, cooldown, tiers) is
+  # environment-configured -- see autoscaler/config.py.
+  # -------------------------------------------------------------------
+
+  autoscaler:
+    build:
+      context: .
+      dockerfile: autoscaler/Dockerfile
+    command: python -m autoscaler
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      CHRONOS_DATABASE_URL: postgresql://${CHRONOS_POSTGRES_USER}:${CHRONOS_POSTGRES_PASSWORD}@postgres:5432/${CHRONOS_POSTGRES_DB}
+      # The autoscaler drives the Compose CLI against the mounted socket;
+      # these point it at this repo's compose file inside the container.
+      CHRONOS_AUTOSCALER_COMPOSE_FILE: /app/docker-compose.yml
+      CHRONOS_AUTOSCALER_PROJECT_DIR: /app
+    volumes:
+      # Source (so it can read /app/docker-compose.yml and /app/.env) ...
+      - .:/app
+      # ... and the Docker socket, so `docker compose` inside this
+      # container acts on the host daemon / the running project. Read-write
+      # is required to create/stop worker containers.
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      postgres:
+        condition: service_healthy
+    stop_grace_period: 15s
+
+  # -------------------------------------------------------------------
+  # Frontend
+  # -------------------------------------------------------------------
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      VITE_CHRONOS_API_URL: ${VITE_CHRONOS_API_URL}
+    volumes:
+      - ./frontend:/app
+      - frontend_node_modules:/app/node_modules
+    ports:
+      - "${CHRONOS_FRONTEND_HOST_PORT}:5173"
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  rabbitmq_data:
+  frontend_node_modules:

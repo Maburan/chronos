@@ -148,11 +148,56 @@ whether the configured concurrency limit for that task type has already
 been reached, and skip the claim attempt if so. It is deliberately
 **fail-open** — any Redis error, timeout, or unavailability is treated as
 "admission granted," so Redis can never block task dispatch by being down.
-It is fully implemented and tested against a real Redis instance, but is
-**not wired into the `python -m worker` entrypoint** shipped in this repo
-— using it today means constructing a `TaskTypeLimiter` and passing it to
-`TaskWorker(..., limiter=...)` directly, as the tests do
-(`tests/test_worker_task_worker_redis.py`).
+It is fully implemented and tested against a real Redis instance, and is
+now wired into the `python -m worker` entrypoint behind an explicit
+opt-in flag: set `CHRONOS_REDIS_LIMITER_ENABLED=1` (plus
+`CHRONOS_REDIS_URL`) to enable it for that worker process; omit it and
+behavior is exactly as before (no limiter, unlimited concurrency). See
+`worker/__main__.py::_build_limiter`.
+
+### Authentication and workflow ownership
+
+Every workflow/task route requires a JWT bearer token (`POST /auth/register`,
+`POST /auth/login`, `POST /auth/logout`, `GET /auth/me` — see
+`api/auth_routes.py`). Passwords are hashed with bcrypt (`auth/
+passwords.py`); tokens are stateless `HS256` JWTs signed with
+`CHRONOS_JWT_SECRET` (`auth/tokens.py`) — there is no server-side session
+table, so `/auth/logout` drops the frontend's locally-stored token but
+cannot revoke it early. Every workflow belongs to exactly one user
+(`workflows.user_id`); every route that reads or mutates a specific
+workflow (`GET/POST /workflows/{id}...`, `GET /tasks/{id}`) checks
+ownership and returns a plain 404 — never 403 — for a workflow that
+either doesn't exist or belongs to someone else, so a caller can't
+distinguish the two. `GET /workflows` lists only the caller's own
+workflows. `core/transitions.py`, the outbox, claiming, leases, and the
+reaper are entirely unaware that authentication exists — ownership is
+checked once, at the HTTP boundary, before any persistence call.
+
+### Task types
+
+`worker/tasks/` registers four task types (`worker/tasks/__init__.py`'s
+`TASK_TYPE_REGISTRY`, also served as metadata via `GET /task-types` for
+the frontend's task-type picker):
+
+- **`echo`** — the original demonstration task (`worker/demo_task.py`,
+  unchanged); logs a message, with `fail_until_attempt`/`sleep_seconds`
+  knobs for demoing retries/crash recovery.
+- **`sleep`** — blocks for `payload.seconds`, capped at 300s.
+- **`http_request`** — one outbound HTTP call, with SSRF guardrails
+  (private/loopback/link-local/metadata addresses blocked by default,
+  redirects never auto-followed, bounded timeout, capped/streamed
+  response body — see `worker/tasks/http_task.py`'s module docstring,
+  including an honestly-documented DNS-rebinding TOCTOU limitation that
+  isn't fully closed).
+- **`python_expression`** — evaluates a whitelist-only restricted
+  arithmetic/comparison expression via a hand-rolled AST walker
+  (`worker/tasks/python_task.py`) — explicitly **not** `eval`/`exec` or
+  general-purpose code execution; no imports, attribute access, or
+  non-whitelisted function calls are reachable.
+- **SQL query task type: deliberately not implemented.** Documented in
+  `worker/tasks/__init__.py`'s module docstring — arbitrary user-supplied
+  SQL against a shared credential has no safe sandbox in this
+  architecture.
 
 ### The fallback polling path
 
@@ -181,6 +226,306 @@ aggregation query — no task rows are fetched into Python to be counted.
 
 ## Quick Start
 
+### Docker Compose (recommended)
+
+The fastest way to run the complete stack locally — no manually-managed
+PostgreSQL/RabbitMQ/Redis, no juggling five terminal windows. This
+orchestrates the *same* distributed processes described throughout this
+README as separate containers; it does not merge them into one process
+(see `docker-compose.yml`'s own comments and HANDOVER.md's Phase 5
+section for the full design rationale).
+
+**Prerequisites:** Docker Desktop (or another Docker Engine + Compose v2
+install) running.
+
+```bash
+# 1. Copy the example environment file and adjust if you like (the
+#    defaults are safe, local-only placeholder credentials -- see
+#    .env.example's own comments). Never commit the real .env.
+cp .env.example .env
+
+# 2. Build and start everything: PostgreSQL, RabbitMQ, Redis, a one-shot
+#    schema migration, the API, the outbox relay, the reaper, one worker
+#    per registered task type (echo/sleep/http_request/python_expression),
+#    and the frontend dev server.
+docker compose up --build
+```
+
+That's it. Once every container reports healthy/started (`docker compose
+ps` shows this), Chronos is reachable at:
+
+- **Frontend:** http://localhost:5173 (or whatever `CHRONOS_FRONTEND_HOST_PORT`
+  is set to in your `.env`)
+- **API:** http://localhost:8000 (`CHRONOS_API_HOST_PORT`) — try
+  `curl http://localhost:8000/healthz`
+- **RabbitMQ management UI:** http://localhost:15672
+  (`CHRONOS_RABBITMQ_MANAGEMENT_HOST_PORT`), login with the
+  `CHRONOS_RABBITMQ_USER`/`CHRONOS_RABBITMQ_PASSWORD` from your `.env`
+
+If any of those ports are already in use on your machine (e.g. a native
+Postgres/RabbitMQ/Redis install, or another project), change the
+corresponding `*_HOST_PORT` variable in `.env` — only the host-published
+port changes; containers still talk to each other over the internal
+Docker network using the standard ports.
+
+**Why a `migrate` service exists:** it runs `python -m db` (the same
+idempotent schema bootstrap `python -m db` always was) once, and every
+other backend service waits for it to *successfully complete* before
+starting (`depends_on: migrate: condition: service_completed_successfully`
+in `docker-compose.yml`). This makes the exact bug a previous development
+session spent hours diagnosing — a backend process starting against a
+database missing a migration — structurally impossible: nothing can start
+against a stale schema again.
+
+**Hot reload:** the API container runs `uvicorn ... --reload` against a
+bind-mounted copy of the repo, and the frontend container runs Vite's own
+dev server the same way — edit code on your host, both pick it up
+automatically. The relay/reaper/worker-\* containers are plain blocking
+loops with no reload machinery of their own (same as running them outside
+Docker); after editing their code, restart just that service:
+
+```bash
+docker compose restart relay
+docker compose restart worker-echo   # or worker-sleep / worker-http_request / worker-python_expression
+docker compose restart reaper
+```
+
+**Logs:**
+
+```bash
+docker compose logs -f                 # everything, follow mode
+docker compose logs -f api             # one service
+docker compose logs --tail 50 worker-echo
+```
+
+**Stopping:**
+
+```bash
+docker compose down        # stops and removes containers; PostgreSQL/RabbitMQ
+                            # data (named volumes) is preserved
+```
+
+**Resetting the database/volumes entirely** (e.g. to start from a
+genuinely empty Postgres, or if you've made a migration mistake locally):
+
+```bash
+docker compose down -v     # also removes postgres_data/rabbitmq_data volumes
+docker compose up --build  # migrate runs against a fresh, empty database again
+```
+
+**A first-boot quirk worth knowing about, not worrying about:** on a cold
+`docker compose up`, the RabbitMQ container can report itself healthy a
+few seconds before its AMQP listener is fully ready to accept
+connections. If you see `relay`/`worker-*` briefly crash with a
+`pika.exceptions.AMQPConnectionError` traceback in the logs right after
+startup, that is expected — Compose's `restart: unless-stopped` policy
+restarts that one container automatically, and it connects successfully
+on the next attempt (typically within 10-15 seconds total). This is the
+same category of transient failure the reaper/crash-recovery design
+throughout this README is built to tolerate, just observed at container
+startup instead of mid-run. No code change fixes this because nothing is
+actually broken; `docker compose ps` settling on every service "Up" (no
+further restarts) is the signal that startup is complete.
+
+**Verifying an end-to-end run** through the Docker stack (same shape as
+the manual walkthrough below, just against the containerized API):
+
+```bash
+TOKEN=$(curl -s -X POST http://localhost:8000/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"email": "demo@chronos.local", "password": "chronos-demo-password"}' \
+  > /dev/null; curl -s -X POST http://localhost:8000/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email": "demo@chronos.local", "password": "chronos-demo-password"}' \
+  | python -c "import sys, json; print(json.load(sys.stdin)['access_token'])")
+
+WFID=$(curl -s -X POST http://localhost:8000/workflows \
+  -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" \
+  -d '{"name": "docker-smoke-test"}' | python -c "import sys, json; print(json.load(sys.stdin)['id'])")
+
+curl -s -X POST http://localhost:8000/workflows/$WFID/tasks \
+  -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" \
+  -d '{"name": "t1", "task_type": "echo", "payload": {"message": "hello from docker"}}'
+
+curl -s http://localhost:8000/workflows/$WFID/status -H "Authorization: Bearer $TOKEN"
+# -> should reach {"is_complete": true, "succeeded": 1, "has_failures": false, ...}
+# within a second or two once the relay/RabbitMQ/worker-echo chain runs it.
+```
+
+## Horizontal scaling and autoscaling
+
+Chronos scales workers along one axis: **more replicas of the same task
+type, all consuming the same queue.** Both the manual and the automatic
+form of that are implemented.
+
+```
+task type  ->  one durable RabbitMQ queue  ->  N worker replicas
+                                                     ^
+                                                     | desired replica count
+                                          Autoscaler (autoscaler/)
+```
+
+### Horizontal scaling (implemented)
+
+Every worker service can run with multiple replicas that all consume the
+one `chronos.tasks.<task_type>` queue — never a queue per replica:
+
+```bash
+docker compose up -d --scale worker-echo=3   # three echo workers, one queue
+```
+
+Each replica gets a **unique, lifetime-stable identity** even though they
+share one service definition and one env: when `CHRONOS_WORKER_ID` is
+unset, `mq.config.derive_worker_id` derives `worker-<task_type>-<hostname>`
+from the container hostname (its container id). Unique identity is what
+keeps lease ownership/fencing, heartbeats, and reaper recovery correct
+under N replicas. Safe concurrency is enforced entirely by PostgreSQL's
+atomic claim (`SELECT ... FOR UPDATE SKIP LOCKED` / the targeted
+conditional `UPDATE`) — RabbitMQ only distributes hints; two workers
+consuming the same queue can never both execute the same task.
+
+### Autoscaling (implemented)
+
+**What it is.** A dedicated control-loop process (`python -m autoscaler`,
+the `autoscaler` Compose service) that periodically observes each task
+type's backlog and adjusts that task type's worker replica count between a
+configured min and max. It is **policy-based, not ML-based**, and is
+**Docker Compose / local-runtime oriented** — see limitations below.
+
+**How it works (architecture).** Three cleanly separated layers, each
+independently unit-tested:
+
+- **Signal — PostgreSQL, the source of truth.** Backlog is the count of
+  `READY` tasks per task type (`db.persistence.get_backlog_counts`, a
+  plain unlocked read). `RUNNING` tasks (already being executed) and
+  terminal/`PENDING` tasks are **not** counted as backlog. No second
+  source of truth is introduced; RabbitMQ queue depth is deliberately
+  *not* used, because in Chronos a queued message only means "maybe
+  claimable", never authoritative state.
+- **Policy — `autoscaler/policy.py`.** A pure function `backlog ->
+  desired replicas`, then clamped to `[min, max]`. Configurable step
+  table; the default:
+
+  | backlog | desired replicas |
+  |--------:|-----------------:|
+  |   0–2   |        1         |
+  |   3–5   |        2         |
+  |   6–10  |        3         |
+  |  11–20  |        4         |
+  |   21+   |        5         |
+
+- **Actuator — `autoscaler/runtime.py`.** The loop depends only on a
+  `WorkerRuntime` abstraction (`current_replicas`, `scale`). The one
+  implementation, `DockerComposeRuntime`, maps a task type to its Compose
+  service (`worker-<task_type>`) and runs
+  `docker compose up -d --no-deps --no-recreate --scale worker-<type>=N
+  worker-<type>` against the daemon (via the mounted Docker socket). A
+  future `KubernetesRuntime` would implement the same two methods with
+  zero change to the policy or the loop.
+
+**Anti-thrash.** The reconcile loop (`autoscaler/autoscaler.py`) is
+deliberately asymmetric — **scale up fast, scale down slow**:
+
+- *Scale-up stabilization*: the higher target must hold for
+  `SCALE_UP_STABILIZATION` consecutive observations before scaling up (so
+  a one-cycle blip is ignored, but a real spike is handled within a couple
+  of intervals).
+- *Scale-down cooldown*: the queue must stay quiet for
+  `SCALE_DOWN_COOLDOWN` seconds before scaling down (so a queue that
+  briefly empties keeps its workers).
+- No runtime call at all when `desired == current`, and steady-state /
+  cooldown states are logged only when they change — no per-cycle spam.
+
+Each task type carries its own independent stabilization/cooldown state.
+
+**Safety.** Autoscaling only ever changes a replica *count*. It never
+touches task state, never claims/acks, never manipulates a lease. Scaling
+a worker down is a plain Compose stop: the worker handles `SIGTERM` by
+letting its current task finish (within `stop_grace_period: 30s`) and then
+exiting; a task that outlives the grace period is hard-killed and left
+`RUNNING` for the **Reaper** to reclaim — the exact crash-recovery path
+that already exists and is tested. No task is lost or executed twice
+because scaling happened.
+
+**Configuration** (all via env / `.env`, documented in `.env.example`;
+same `from_env()` convention as the rest of Chronos — see
+`autoscaler/config.py`):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `CHRONOS_AUTOSCALER_ENABLED` | `false` | Master switch (set `1` in `.env` for the stack) |
+| `CHRONOS_AUTOSCALER_INTERVAL` | `10` | Seconds between observations |
+| `CHRONOS_AUTOSCALER_MIN_REPLICAS` | `1` | Lower clamp |
+| `CHRONOS_AUTOSCALER_MAX_REPLICAS` | `5` | Upper clamp |
+| `CHRONOS_AUTOSCALER_SCALE_UP_STABILIZATION` | `2` | Consecutive observations before scale-up |
+| `CHRONOS_AUTOSCALER_SCALE_DOWN_COOLDOWN` | `60` | Quiet seconds before scale-down |
+| `CHRONOS_AUTOSCALER_BACKLOG_TIERS` | `0:1,3:2,6:3,11:4,21:5` | Backlog→replica step table |
+| `CHRONOS_AUTOSCALER_TASK_TYPES` | `CHRONOS_TASK_TYPES` | Which task types to manage |
+| `CHRONOS_AUTOSCALER_SERVICE_PREFIX` | `worker-` | `service = prefix + task_type` |
+| `CHRONOS_AUTOSCALER_COMPOSE_PROJECT` | auto-detect | Compose project to scale |
+
+**How to observe it.** The autoscaler logs decisions (and only decisions,
+not every idle cycle):
+
+```
+[autoscaler] echo backlog=8 current=1 desired=3
+[autoscaler] scaling worker-echo 1 -> 3
+...
+[autoscaler] echo backlog=0 current=3 desired=1 scale-down cooldown active (24s/60s)
+[autoscaler] scaling worker-echo 3 -> 1 (cooldown elapsed)
+```
+
+```bash
+docker compose logs -f autoscaler          # scaling decisions
+docker compose ps worker-echo               # current replica count
+docker exec chronos-rabbitmq-1 rabbitmqctl list_queues name consumers   # consumers on each queue
+```
+
+**Running a scaling demo:**
+
+```bash
+docker compose up -d --build          # autoscaler enabled by default via .env; starts 1 of each worker
+# submit a burst of long-ish echo tasks (auth as in the end-to-end snippet above), e.g. 30 tasks with
+#   payload {"message": "x", "sleep_seconds": 8}
+# then watch:
+docker compose logs -f autoscaler     # observe backlog rise -> "scaling worker-echo 1 -> 5"
+docker compose ps worker-echo         # replica count climbs to MAX
+# let the queue drain, wait out the cooldown, and watch it scale back to MIN:
+#   "scaling worker-echo 5 -> 1 (cooldown elapsed)"
+```
+
+*(An observed run: backlog of 40 echo tasks scaled `worker-echo` 1→5 within
+~20s, five consumers shared the one queue with up to four replicas
+executing concurrently, then it scaled 5→1 after the 60s cooldown once the
+queue drained — all 40 tasks SUCCEEDED. Killing a replica mid-task during
+this was recovered by the Reaper and completed by another replica, with the
+autoscaler running throughout.)*
+
+### Current limitations
+
+- **Local runtime only.** Only `DockerComposeRuntime` exists.
+  **Kubernetes / cloud autoscaling is NOT implemented**, and there is **no
+  automatic cloud resource provisioning** — the autoscaler adjusts replica
+  counts of already-defined Compose services on one host; it never
+  provisions machines. The `WorkerRuntime` seam exists so a
+  `KubernetesRuntime` can be added later without touching the policy.
+- **Policy-based, not ML-based.** Fixed step-table thresholds; no
+  prediction, no learning.
+- Backlog uses only `READY` count today. The policy is a pure function so
+  an additional signal (e.g. oldest-queued-task age) can be folded in
+  later without touching the runtime or the loop; it is intentionally left
+  out of the first version.
+- The autoscaler drives Compose via the host Docker socket it mounts —
+  appropriate for local/dev, not a hardened multi-tenant control plane.
+- With the default per-worker `prefetch` of 10, a single worker that is
+  already consuming can buffer several dispatch hints locally, so a burst
+  submitted *before* scale-up may be partly drained by the first replica
+  rather than perfectly spread; scaling still adds real concurrent
+  capacity. Lower `CHRONOS_WORKER_PREFETCH` (e.g. to 1) for long tasks if
+  you want the tightest possible spread.
+
+### Manual (without Docker)
+
 Chronos assumes PostgreSQL, RabbitMQ, and (optionally) Redis are already
 running and reachable — however you run them locally is up to you; Chronos
 itself makes no assumption beyond a working connection string for each.
@@ -191,10 +536,14 @@ createdb chronos
 
 # Environment variables Chronos reads (see mq/config.py, api/config.py):
 export CHRONOS_DATABASE_URL="postgresql://postgres:<password>@localhost:5432/chronos"
+export CHRONOS_JWT_SECRET="<a long random string -- required, no default>"
 export CHRONOS_RABBITMQ_URL="amqp://guest:guest@localhost:5672/"
 export CHRONOS_TASK_TYPES="echo"          # declared by the relay at startup
 export CHRONOS_WORKER_ID="worker-1"
 export CHRONOS_WORKER_TASK_TYPE="echo"
+# Optional: enable the Redis admission limiter for this worker.
+# export CHRONOS_REDIS_LIMITER_ENABLED="1"
+# export CHRONOS_REDIS_URL="redis://localhost:6379/0"
 
 # 1. Bootstrap the schema (idempotent -- safe to run again later).
 python -m db
@@ -214,27 +563,45 @@ npm install    # first time only
 npm run dev    # -> http://localhost:5173
 ```
 
-With all four running, create a workflow and a task, then poll its status:
+With all four running, register a user, log in, create a workflow and a
+task, then poll its status. Every workflow/task route requires the bearer
+token from login (see "Authentication and workflow ownership" above):
 
 ```bash
+# Register, then log in to get a bearer token.
+curl -s -X POST http://127.0.0.1:8000/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"email": "demo@chronos.local", "password": "chronos-demo-password"}'
+
+TOKEN=$(curl -s -X POST http://127.0.0.1:8000/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email": "demo@chronos.local", "password": "chronos-demo-password"}' \
+  | python -c "import sys, json; print(json.load(sys.stdin)['access_token'])")
+
 # Create a workflow.
 curl -s -X POST http://127.0.0.1:8000/workflows \
-  -H "Content-Type: application/json" \
+  -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" \
   -d '{"name": "demo"}'
-# -> {"id": 1, "name": "demo", "created_at": "..."}
+# -> {"id": 1, "name": "demo", "user_id": 1, "created_at": "..."}
 
-# Create a task in it (task_type "echo" is the one registered demo task
-# type -- see worker/demo_task.py).
+# Create a task in it (task_type "echo" is the original demo task type --
+# see worker/demo_task.py; worker/tasks/ also registers sleep,
+# http_request, and python_expression -- see GET /task-types).
 curl -s -X POST http://127.0.0.1:8000/workflows/1/tasks \
-  -H "Content-Type: application/json" \
+  -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" \
   -d '{"name": "t1", "task_type": "echo", "payload": {"message": "hello"}}'
 # -> {"id": 1, "state": "READY", ...}
 
 # Poll the workflow's rollup status until it's complete.
-curl -s http://127.0.0.1:8000/workflows/1/status
+curl -s http://127.0.0.1:8000/workflows/1/status -H "Authorization: Bearer $TOKEN"
 # -> {"workflow_id": 1, "total_tasks": 1, "succeeded": 1, ...,
 #     "is_complete": true, "has_failures": false}
 ```
+
+Alternatively, seed a few more realistic example workflows (a linear
+pipeline, a parallel diamond, and a retry demo) through the same public
+API with `python -m scripts.seed_demo_workflows` (see `scripts/
+seed_demo_workflows.py` — registers/logs in a demo user itself).
 
 ## Frontend / Dashboard
 
@@ -245,41 +612,44 @@ the execution flow (`PENDING/READY -> RUNNING -> SUCCEEDED /
 FAILED_TERMINAL / SKIPPED`) visible without reading logs or writing curl
 commands by hand.
 
-What it shows, all sourced from the existing endpoints (`POST
-/workflows`, `GET /workflows/{id}`, `POST /workflows/{id}/tasks`, `GET
-/tasks/{id}`, `GET /workflows/{id}/tasks`, `GET
-/workflows/{id}/status`, `GET /healthz`, `GET /readyz`):
+Routes (React Router, `frontend/src/App.tsx`):
 
-- **Workflow creation and lookup** — there is no "list workflows"
-  endpoint, so the dashboard navigates by a known workflow id (created
-  or loaded), same as any other API client would have to.
-- **A static pipeline diagram** (API -> Postgres/Outbox -> Outbox Relay
-  -> RabbitMQ -> Worker -> Task Execution) explaining the architecture
-  above at a glance — it does not claim to monitor RabbitMQ or the
-  worker process individually, since no endpoint exposes that.
-- **Live task state** via 2-second polling of `GET
-  /workflows/{id}/tasks` and `.../status` — there is no push/WebSocket
-  channel in the API, so polling is the only mechanism available, and
-  the dashboard is explicit about that rather than implying otherwise.
-- **A task detail panel** with attempt counts, lease owner/expiry, full
-  payload, and a lifecycle stepper derived from the task's *current*
-  state — not a fabricated event history, since the API only returns
-  the current row.
-- **A dependency graph** built from `depends_on_ids` submitted through
-  the dashboard itself in the current browser session (the API has no
-  endpoint to read a task's dependency edges back out) — tasks whose
-  edges weren't submitted this session are shown as explicitly
-  unverified, dashed nodes, never silently presented as edge-free.
-- **A one-click retry-demo helper** that fills the task payload with
-  `{"message": "retry demo", "fail_until_attempt": 3}` (see
-  `worker/demo_task.py`'s `echo` task type) without submitting it, so a
-  retry cycle (`attempt_count` climbing 1 -> 2 -> 3 before succeeding)
-  can be triggered and watched on demand.
+- **`/login`, `/register`** — email/password forms against `POST
+  /auth/login` / `POST /auth/register`; the JWT is stored in
+  `localStorage` (`frontend/src/api.ts`) and attached as an
+  `Authorization` header on every subsequent request
+  (`frontend/src/auth/AuthContext.tsx`).
+- **`/`** — dashboard: total/running/completed/failed workflow counts
+  (derived from `GET /workflows` + one `GET /workflows/{id}/status` per
+  workflow, run in parallel — there is no dedicated dashboard-aggregation
+  endpoint) and a recent-workflows list.
+- **`/workflows`** — the caller's own workflows (`GET /workflows`, added
+  specifically for this frontend work — see `db/persistence.py::
+  list_workflows_for_user`).
+- **`/workflows/new`** — creates a workflow, then hands off to its detail
+  page; there is no separate "draft" state — each task added there is
+  already a real, persisted `POST /workflows/{id}/tasks` call.
+- **`/workflows/:id`** — task creation (task-type picker sourced from
+  `GET /task-types`, dependency picker, JSON payload editor with a
+  generated template), a live task table (2-second polling — there is no
+  push/WebSocket channel in the API), a task detail panel (attempt
+  counts, lease owner/expiry, full payload, a lifecycle stepper derived
+  from the task's *current* state, not a fabricated history), and a
+  dependency graph now built directly from each task's own
+  `depends_on_ids` (returned by `GET /workflows/{id}/tasks` — no longer a
+  client-session-only approximation).
+- A static pipeline diagram (API -> Postgres/Outbox -> Outbox Relay ->
+  RabbitMQ -> Worker -> Task Execution) and a one-click retry-demo helper
+  (`fail_until_attempt`) are unchanged from the original single-page
+  version.
 
 The frontend requires CORS enabled on the API for its own origin
 (`http://localhost:5173` by default — see `api/config.py`'s
 `cors_origins` / `CHRONOS_API_CORS_ORIGINS`) and otherwise makes no
-changes to backend behavior.
+changes to backend behavior. Bearer-token auth (not cookies) means CSRF
+doesn't apply to these requests; the token is `localStorage`-resident, so
+the usual XSS-exposes-the-token tradeoff applies (mitigated by a
+reasonably short default JWT expiry, `CHRONOS_JWT_EXPIRY_MINUTES`).
 
 ## Crash Recovery Demo
 
@@ -303,7 +673,7 @@ genuinely executing:
 
 ```bash
 curl -s -X POST http://127.0.0.1:8000/workflows/1/tasks \
-  -H "Content-Type: application/json" \
+  -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" \
   -d '{"name": "crash-demo", "task_type": "echo", "max_attempts": 2,
        "payload": {"message": "will survive a crash", "sleep_seconds": 20}}'
 ```
@@ -311,7 +681,7 @@ curl -s -X POST http://127.0.0.1:8000/workflows/1/tasks \
 **3. Watch it become `RUNNING`:**
 
 ```bash
-curl -s http://127.0.0.1:8000/tasks/2
+curl -s http://127.0.0.1:8000/tasks/2 -H "Authorization: Bearer $TOKEN"
 # -> {"state": "RUNNING", "lease_owner": "worker-1", "attempt_count": 1, ...}
 ```
 
@@ -328,7 +698,7 @@ taskkill /F /PID <pid>              # Windows
 still valid — nothing recovers it yet, by design:
 
 ```bash
-curl -s http://127.0.0.1:8000/tasks/2
+curl -s http://127.0.0.1:8000/tasks/2 -H "Authorization: Bearer $TOKEN"
 # -> still {"state": "RUNNING", "lease_owner": "worker-1", ...}
 ```
 
@@ -355,7 +725,7 @@ print(result)
 produced for it:
 
 ```bash
-curl -s http://127.0.0.1:8000/tasks/2
+curl -s http://127.0.0.1:8000/tasks/2 -H "Authorization: Bearer $TOKEN"
 # -> {"state": "READY", "lease_owner": null, "attempt_count": 1, ...}
 ```
 
@@ -372,7 +742,7 @@ python -m worker
 **10. Observe the final state:**
 
 ```bash
-curl -s http://127.0.0.1:8000/tasks/2
+curl -s http://127.0.0.1:8000/tasks/2 -H "Authorization: Bearer $TOKEN"
 # -> {"state": "SUCCEEDED", "attempt_count": 2, "lease_owner": null, ...}
 ```
 
@@ -423,10 +793,14 @@ itself be a long-running process, not a one-off script).
 
 ## Testing
 
-**351 tests, 0 failures, 0 skipped, 0 warnings**, run against real
-PostgreSQL, real RabbitMQ, and real Redis simultaneously (no service is
-mocked in the integration/end-to-end suite; unit tests for pure logic —
-e.g. `core/transitions.py` — use no infrastructure at all, by design).
+**418 tests collected** (up from the earlier 351/351 baseline — the
+difference is entirely new coverage added for auth/authorization, the
+new task types, `GET /task-types`, and the Redis-limiter wiring; no
+existing test was deleted or weakened). Run against real PostgreSQL, real
+RabbitMQ, and real Redis simultaneously for the full integration/
+end-to-end suite (no service is mocked there); unit tests for pure logic
+— e.g. `core/transitions.py`, `worker/tasks/*` — use no infrastructure at
+all, by design.
 
 Among those 351: real concurrency tests that race a live reaper against a
 live worker reporting completion using genuinely separate database
@@ -444,8 +818,21 @@ limitations" below.
 
 ## Known limitations
 
-- **No API authentication.** Every endpoint is open; this is not
-  acceptable for any real deployment.
+- **No password reset, email verification, or server-side token
+  revocation.** Auth is deliberately minimal — register/login/logout/me
+  only. A stolen JWT is valid until it expires; there is no way to force
+  it invalid earlier short of rotating `CHRONOS_JWT_SECRET` (which
+  invalidates *every* issued token, not just one).
+- **`http_request`'s SSRF guard has a DNS-rebinding TOCTOU gap.** The
+  hostname is resolved and checked once before the request; the actual
+  outbound connection resolves DNS again. See `worker/tasks/http_task.py`'s
+  module docstring.
+- **Workflow/task name length is unbounded at the API layer.** Pre-existing,
+  not introduced by this round of work — `CreateWorkflowRequest.name`/
+  `CreateTaskRequest.name` have no `max_length`.
+- **The dashboard's workflow counts cost one `GET /status` call per
+  workflow** (run in parallel, but still O(n) requests) — fine at demo
+  scale, not the shape you'd want for hundreds of workflows.
 - **No task cancellation.** Once claimed, a task cannot be told to stop;
   it runs to completion or until its lease expires.
 - **Limited observability.** Structured logs exist throughout, but there
@@ -463,10 +850,11 @@ limitations" below.
   running (a partition, not a crash), or RabbitMQ/Postgres restarting
   mid-operation, are different failure shapes that have not been tested
   the same way.
-- **The Redis limiter and the fallback poller have no standalone
-  entrypoint.** Both are fully implemented and tested, but using either
-  today means writing a small amount of wiring code yourself (see the
-  sections above) rather than running a shipped command.
+- **The fallback poller has no standalone entrypoint.** Fully implemented
+  and tested, but using it today means writing a small amount of wiring
+  code yourself (see `worker/fallback_poller.py`) rather than running a
+  shipped command. (The Redis limiter now does have a wired-in entrypoint
+  — see above.)
 
 ---
 

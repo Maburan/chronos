@@ -6,14 +6,16 @@ control flow around it.
 """
 
 CREATE_WORKFLOW = """
-INSERT INTO workflows (name)
-VALUES (%(name)s)
-RETURNING id, name, created_at;
+INSERT INTO workflows (name, user_id)
+VALUES (%(name)s, %(user_id)s)
+RETURNING id, name, user_id, created_at;
 """
 
 INSERT_TASK = """
-INSERT INTO tasks (workflow_id, name, task_type, state, max_attempts, payload)
-VALUES (%(workflow_id)s, %(name)s, %(task_type)s, %(state)s, %(max_attempts)s, %(payload)s)
+INSERT INTO tasks (workflow_id, name, task_type, state, max_attempts, payload,
+                    workflow_run_id, task_definition_id)
+VALUES (%(workflow_id)s, %(name)s, %(task_type)s, %(state)s, %(max_attempts)s, %(payload)s,
+        %(workflow_run_id)s, %(task_definition_id)s)
 RETURNING *;
 """
 
@@ -224,9 +226,21 @@ RETURNING *;
 # existing, unmodified persistence function (create_workflow, create_task).
 
 SELECT_WORKFLOW_BY_ID = """
-SELECT id, name, created_at
+SELECT id, name, user_id, created_at
 FROM workflows
 WHERE id = %(workflow_id)s;
+"""
+
+# Dashboard/list-view read: a user's own workflows, most-recently-created
+# first. Never joins to tasks -- a caller that also wants per-workflow
+# status calls get_workflow_task_state_counts per id, same as the existing
+# GET /workflows/{id}/status route already does; this stays a single cheap
+# query over the (user_id-indexed) workflows table only.
+SELECT_WORKFLOWS_FOR_USER = """
+SELECT id, name, user_id, created_at
+FROM workflows
+WHERE user_id = %(user_id)s
+ORDER BY created_at DESC;
 """
 
 SELECT_TASK_BY_ID = """
@@ -240,6 +254,22 @@ SELECT *
 FROM tasks
 WHERE workflow_id = %(workflow_id)s
 ORDER BY id ASC;
+"""
+
+# Every dependency edge for every task in one workflow, in one query --
+# used to attach each task's depends_on_ids for the API response (see
+# db.persistence.list_tasks_for_workflow) without an N+1 query per task.
+SELECT_DEPENDENCIES_FOR_WORKFLOW = """
+SELECT td.task_id, td.depends_on_task_id
+FROM task_dependencies td
+JOIN tasks t ON t.id = td.task_id
+WHERE t.workflow_id = %(workflow_id)s;
+"""
+
+SELECT_DEPENDENCIES_FOR_TASK = """
+SELECT depends_on_task_id
+FROM task_dependencies
+WHERE task_id = %(task_id)s;
 """
 
 # One aggregation query per state, computed in PostgreSQL rather
@@ -262,6 +292,124 @@ SELECT
     count(*) FILTER (WHERE state = 'SKIPPED') AS skipped
 FROM tasks
 WHERE workflow_id = %(workflow_id)s;
+"""
+
+# ---------------------------------------------------------------------------
+# workflow definitions (Builder design-time graph -- never executed
+# directly; see db.persistence.save_workflow_definition/
+# get_workflow_definition and the module docstring on Definition vs Run)
+# ---------------------------------------------------------------------------
+
+# Whole-graph replace semantics: Save always deletes every existing
+# task_definitions row for this workflow (CASCADE also removes their
+# task_definition_dependencies rows) before inserting the new set, in the
+# same transaction. There is no partial/incremental edit at the SQL layer
+# -- the Builder always sends the complete current graph.
+DELETE_TASK_DEFINITIONS_FOR_WORKFLOW = """
+DELETE FROM task_definitions WHERE workflow_id = %(workflow_id)s;
+"""
+
+INSERT_TASK_DEFINITION = """
+INSERT INTO task_definitions
+    (workflow_id, name, task_type, max_attempts, payload, position_x, position_y)
+VALUES
+    (%(workflow_id)s, %(name)s, %(task_type)s, %(max_attempts)s, %(payload)s,
+     %(position_x)s, %(position_y)s)
+RETURNING *;
+"""
+
+INSERT_TASK_DEFINITION_DEPENDENCY = """
+INSERT INTO task_definition_dependencies
+    (task_definition_id, depends_on_task_definition_id, branch)
+VALUES (%(task_definition_id)s, %(depends_on_task_definition_id)s, %(branch)s);
+"""
+
+SELECT_TASK_DEFINITIONS_FOR_WORKFLOW = """
+SELECT * FROM task_definitions WHERE workflow_id = %(workflow_id)s ORDER BY id ASC;
+"""
+
+SELECT_TASK_DEFINITION_DEPENDENCIES_FOR_WORKFLOW = """
+SELECT tdd.task_definition_id, tdd.depends_on_task_definition_id, tdd.branch
+FROM task_definition_dependencies tdd
+JOIN task_definitions td ON td.id = tdd.task_definition_id
+WHERE td.workflow_id = %(workflow_id)s;
+"""
+
+# ---------------------------------------------------------------------------
+# workflow runs (materialized executions of a workflow definition)
+# ---------------------------------------------------------------------------
+
+INSERT_WORKFLOW_RUN = """
+INSERT INTO workflow_runs (workflow_id, triggered_by_user_id, definition_snapshot)
+VALUES (%(workflow_id)s, %(triggered_by_user_id)s, %(definition_snapshot)s)
+RETURNING *;
+"""
+
+SELECT_WORKFLOW_RUN_BY_ID = """
+SELECT * FROM workflow_runs WHERE id = %(run_id)s;
+"""
+
+SELECT_WORKFLOW_RUNS_FOR_WORKFLOW = """
+SELECT * FROM workflow_runs WHERE workflow_id = %(workflow_id)s ORDER BY created_at DESC;
+"""
+
+SELECT_TASKS_FOR_RUN = """
+SELECT * FROM tasks WHERE workflow_run_id = %(run_id)s ORDER BY id ASC;
+"""
+
+SELECT_DEPENDENCIES_FOR_RUN = """
+SELECT td.task_id, td.depends_on_task_id
+FROM task_dependencies td
+JOIN tasks t ON t.id = td.task_id
+WHERE t.workflow_run_id = %(run_id)s;
+"""
+
+# Same shape as SELECT_WORKFLOW_TASK_STATE_COUNTS, scoped to one run
+# instead of one workflow -- lets run history compute the identical
+# is_complete/has_failures rollup per execution rather than only ever for
+# "the workflow as a whole" (which, once a workflow can be run more than
+# once, would conflate every run's tasks together).
+SELECT_RUN_TASK_STATE_COUNTS = """
+SELECT
+    count(*) AS total_tasks,
+    count(*) FILTER (WHERE state = 'PENDING') AS pending,
+    count(*) FILTER (WHERE state = 'READY') AS ready,
+    count(*) FILTER (WHERE state = 'RUNNING') AS running,
+    count(*) FILTER (WHERE state = 'SUCCEEDED') AS succeeded,
+    count(*) FILTER (WHERE state = 'FAILED_TERMINAL') AS failed_terminal,
+    count(*) FILTER (WHERE state = 'SKIPPED') AS skipped
+FROM tasks
+WHERE workflow_run_id = %(run_id)s;
+"""
+
+# ---------------------------------------------------------------------------
+# autoscaler backlog signal (read-only)
+# ---------------------------------------------------------------------------
+
+# Per-task-type live workload, computed entirely in PostgreSQL. Used only
+# by the autoscaler (autoscaler/) to decide a desired replica count -- it
+# reads task state, never writes it, and is deliberately a plain, unlocked
+# read like every other API/status query: it must never block, or be
+# blocked by, a concurrent claim/report/heartbeat/reaper transaction.
+#
+# ``backlog`` = READY tasks (waiting to be processed, i.e. the work that
+# more workers would help drain). ``running`` = RUNNING tasks (already
+# being executed under a lease). Terminal states (SUCCEEDED /
+# FAILED_TERMINAL / SKIPPED) and PENDING (blocked on dependencies, not yet
+# dispatchable) are deliberately NOT counted as backlog -- scaling up
+# workers cannot help either of those. Only task types that currently have
+# at least one non-terminal row appear; a type with no rows is simply
+# absent (the autoscaler treats a missing type as backlog 0). PostgreSQL
+# remains the single source of truth for task state; this introduces no
+# second one.
+SELECT_BACKLOG_COUNTS_BY_TASK_TYPE = """
+SELECT
+    task_type,
+    count(*) FILTER (WHERE state = 'READY') AS backlog,
+    count(*) FILTER (WHERE state = 'RUNNING') AS running
+FROM tasks
+WHERE state IN ('READY', 'RUNNING')
+GROUP BY task_type;
 """
 
 # ---------------------------------------------------------------------------

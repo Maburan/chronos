@@ -16,7 +16,7 @@ LEASE = timedelta(minutes=5)
 
 
 def _make_workflow(db):
-    return persistence.create_workflow(db, name="wf")
+    return persistence.create_workflow(db, name="wf", user_id=db.test_user_id)
 
 
 # ---------------------------------------------------------------------------
@@ -25,7 +25,7 @@ def _make_workflow(db):
 
 
 def test_create_workflow(db):
-    wf = persistence.create_workflow(db, name="demo")
+    wf = persistence.create_workflow(db, name="demo", user_id=db.test_user_id)
     assert wf["name"] == "demo"
     assert wf["id"] is not None
 
@@ -750,7 +750,7 @@ def test_list_tasks_for_workflow_empty_when_workflow_does_not_exist(db):
 
 def test_list_tasks_for_workflow_only_includes_that_workflow(db):
     wf1 = _make_workflow(db)
-    wf2 = persistence.create_workflow(db, name="wf2")
+    wf2 = persistence.create_workflow(db, name="wf2", user_id=db.test_user_id)
     t1 = persistence.create_task(db, workflow_id=wf1["id"], name="a", task_type="noop")
     persistence.create_task(db, workflow_id=wf2["id"], name="b", task_type="noop")
 

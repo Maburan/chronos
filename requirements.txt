@@ -3,7 +3,13 @@ pika>=1.3
 redis>=5.0
 fastapi>=0.110
 uvicorn>=0.29
+bcrypt>=4.1
+pyjwt>=2.8
+email-validator>=2.0  # required by pydantic.EmailStr (api/schemas.py's RegisterRequest/LoginRequest)
 httpx>=0.27
-httpx2>=2.0  # test-only: starlette's TestClient (used by tests/test_api_*.py) prefers this over httpx
+httpx2>=2.0  # test-only: starlette.testclient.TestClient imports httpx2 first and only
+             # falls back to httpx with a DeprecationWarning if it's missing -- this
+             # project's test baseline is 0 warnings under -W error::DeprecationWarning
+             # (see HANDOVER.md), so the fallback path would hard-fail the suite
 pytest>=8.0
 testcontainers[postgres]>=4.0

@@ -150,7 +150,7 @@ def test_end_to_end_denied_admission_leaves_task_ready_and_no_attempt(db, task_t
     limiter = TaskTypeLimiter(_config(default_limit=1))
     assert limiter.acquire(task_type=task_type, worker_id="occupier", task_id=0) is True
 
-    wf = persistence.create_workflow(db, name="wf")
+    wf = persistence.create_workflow(db, name="wf", user_id=db.test_user_id)
     task = persistence.create_task(db, workflow_id=wf["id"], name="t1", task_type=task_type)
 
     # Simulate what TaskWorker does on denial: check admission, and since

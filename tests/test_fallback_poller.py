@@ -21,7 +21,7 @@ LEASE = timedelta(minutes=5)
 
 
 def _make_workflow(db):
-    return persistence.create_workflow(db, name="wf")
+    return persistence.create_workflow(db, name="wf", user_id=db.test_user_id)
 
 
 def _poller(db, registry, *, worker_id="fallback-1", clock=lambda: NOW):
@@ -149,7 +149,7 @@ def test_fallback_poller_and_targeted_claim_never_double_claim(db, db_dsn):
     RabbitMQ-driven worker path) concurrently. Every task must end up
     claimed by exactly one side, never both."""
     n_tasks = 40
-    wf = persistence.create_workflow(db, name="concurrency-wf")
+    wf = persistence.create_workflow(db, name="concurrency-wf", user_id=db.test_user_id)
     task_ids = [
         persistence.create_task(db, workflow_id=wf["id"], name=f"t{i}", task_type="noop").id
         for i in range(n_tasks)

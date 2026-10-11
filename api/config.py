@@ -33,6 +33,12 @@ class ApiConfig:
     # server-side capability and is not read by anything else in this
     # project. Comma-separated to override for a different dev port.
     cors_origins: tuple[str, ...] = ("http://localhost:5173", "http://127.0.0.1:5173")
+    # JWT signing secret. No default in from_env() -- a missing secret
+    # must fail loudly at startup, never silently fall back to a
+    # guessable value. Tests construct ApiConfig directly with a fixed
+    # test secret (see tests/conftest.py), same pattern as database_url.
+    jwt_secret: str = ""
+    jwt_expiry_minutes: int = 60 * 24
 
     @classmethod
     def from_env(cls) -> "ApiConfig":
@@ -41,6 +47,12 @@ class ApiConfig:
             raise ConfigError(
                 "CHRONOS_DATABASE_URL is not set; the API needs a "
                 "PostgreSQL connection string, never hard-coded"
+            )
+        jwt_secret = os.environ.get("CHRONOS_JWT_SECRET")
+        if not jwt_secret:
+            raise ConfigError(
+                "CHRONOS_JWT_SECRET is not set; the API needs a secret to "
+                "sign/verify auth tokens, never hard-coded or defaulted"
             )
         cors_origins_env = os.environ.get("CHRONOS_API_CORS_ORIGINS")
         cors_origins = (
@@ -55,4 +67,8 @@ class ApiConfig:
             pool_min_size=int(os.environ.get("CHRONOS_API_POOL_MIN_SIZE", "1")),
             pool_max_size=int(os.environ.get("CHRONOS_API_POOL_MAX_SIZE", "10")),
             cors_origins=cors_origins,
+            jwt_secret=jwt_secret,
+            jwt_expiry_minutes=int(
+                os.environ.get("CHRONOS_JWT_EXPIRY_MINUTES", str(60 * 24))
+            ),
         )

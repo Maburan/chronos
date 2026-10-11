@@ -46,13 +46,13 @@ import json
 import logging
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 from psycopg_pool import ConnectionPool
 
 from db import queries
 from mq.config import RelayConfig
-from mq.connection import ConfirmedPublisher
+from mq.connection import BrokerUnavailableError, ConfirmedPublisher
 from mq.topology import routing_key_for_task_type
 
 logger = logging.getLogger(__name__)
@@ -76,6 +76,20 @@ class OutboxRelay:
     tests inject a fake, production code injects a
     ``mq.connection.RabbitMQPublisher``. The relay itself never imports
     pika.
+
+    ``reconnect``, if given, is a zero-argument callable that builds and
+    returns a brand-new ``ConfirmedPublisher`` (production code passes
+    something that opens a fresh ``pika.BlockingConnection`` + declares
+    topology again, mirroring ``relay/__main__.py``'s original
+    construction). It exists solely to recover from a *connection/channel-
+    level* publish failure (``BrokerUnavailableError`` -- see
+    ``mq/connection.py``): the original long-lived publisher's underlying
+    connection can die mid-run (broker restart, idle-connection drop,
+    network blip) and, unlike an ordinary "not confirmed" outcome, no
+    amount of retrying against the *same* dead channel will ever recover --
+    see ``_attempt_reconnect`` below. Omitting it (the default, ``None``)
+    preserves the exact pre-existing behavior: a broken publisher simply
+    keeps failing forever, exactly as before this was added.
     """
 
     def __init__(
@@ -84,10 +98,22 @@ class OutboxRelay:
         publisher: ConfirmedPublisher,
         *,
         config: Optional[RelayConfig] = None,
+        reconnect: Optional[Callable[[], ConfirmedPublisher]] = None,
     ) -> None:
         self._pool = pool
         self._publisher = publisher
         self._config = config or RelayConfig()
+        self._reconnect = reconnect
+
+    @property
+    def publisher(self) -> ConfirmedPublisher:
+        """The publisher currently in use -- may not be the one passed to
+        ``__init__`` if a connection-level failure triggered a reconnect
+        (see ``_attempt_reconnect``). Exposed so a caller (``relay/
+        __main__.py``) can close whichever one is actually live on
+        shutdown, rather than holding its own now-possibly-stale
+        reference."""
+        return self._publisher
 
     # -- one polling pass -----------------------------------------------
 
@@ -112,7 +138,29 @@ class OutboxRelay:
         for event in events:
             try:
                 confirmed = self._publish_event(event)
-            except Exception:  # noqa: BLE001 - any publisher failure is "not confirmed"
+            except BrokerUnavailableError:
+                # Distinct from an ordinary "not confirmed" outcome
+                # (a broker Nack/Unroutable, handled by _publish_event
+                # returning False below, or any other publisher-raised
+                # exception, handled by the generic except clause
+                # further down): this specific exception means the
+                # underlying connection/channel itself is unusable, not
+                # just that one message was rejected -- see
+                # mq/connection.py's own docstring for the distinction.
+                # Every remaining event in this batch would fail the
+                # exact same way against the same dead connection, so
+                # this is the one failure mode worth reacting to instead
+                # of just logging and moving on.
+                logger.warning(
+                    "outbox relay: connection-level publish failure for "
+                    "event_id=%s, leaving unpublished",
+                    event["id"],
+                    exc_info=True,
+                )
+                errors += 1
+                self._attempt_reconnect()
+                continue
+            except Exception:  # noqa: BLE001 - any other publisher failure is "not confirmed"
                 logger.warning(
                     "outbox relay: publish failed for event_id=%s, leaving unpublished",
                     event["id"],
@@ -169,6 +217,46 @@ class OutboxRelay:
         return RelayIterationResult(
             fetched=len(events), published=published, errors=errors
         )
+
+    def _attempt_reconnect(self) -> None:
+        """Best-effort recovery from a connection/channel-level publish
+        failure (see the ``BrokerUnavailableError`` branch in
+        ``run_once``). Never raises -- a reconnect attempt that itself
+        fails (broker still down) is exactly the same "leave it
+        unpublished, try again later" outcome as the original failure,
+        handled by the existing exponential backoff in ``run_forever``;
+        it must not crash the relay loop or be treated as a *worse*
+        error than the one that triggered it.
+
+        No-op if no ``reconnect`` callable was provided -- preserves the
+        exact pre-existing behavior (keep retrying the same broken
+        publisher forever) for any caller that doesn't opt in.
+        """
+        if self._reconnect is None:
+            return
+
+        try:
+            close = getattr(self._publisher, "close", None)
+            if close is not None:
+                close()
+        except Exception:  # noqa: BLE001 - it's already broken; closing it is best-effort
+            logger.warning(
+                "outbox relay: error closing the broken publisher during reconnect",
+                exc_info=True,
+            )
+
+        try:
+            self._publisher = self._reconnect()
+        except Exception:  # noqa: BLE001 - broker may still be down; retry on a later pass
+            logger.warning(
+                "outbox relay: reconnect attempt failed; will retry on a later pass",
+                exc_info=True,
+            )
+        else:
+            logger.info(
+                "outbox relay: reconnected to RabbitMQ after a connection-level "
+                "publish failure"
+            )
 
     def _fetch_unpublished_batch(self) -> list[dict]:
         with self._pool.connection() as conn:

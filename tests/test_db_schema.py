@@ -30,7 +30,8 @@ def test_lease_pair_consistent_rejects_owner_without_expiry(db):
         with pytest.raises(psycopg.errors.CheckViolation):
             with conn.transaction():
                 conn.execute(
-                    "INSERT INTO workflows (name) VALUES ('wf') RETURNING id"
+                    "INSERT INTO workflows (name, user_id) VALUES ('wf', %s) RETURNING id",
+                    (db.test_user_id,),
                 )
                 wf_id = conn.execute("SELECT id FROM workflows ORDER BY id DESC LIMIT 1").fetchone()["id"]
                 conn.execute(
@@ -44,7 +45,9 @@ def test_lease_requires_running_rejects_lease_on_ready_task(db):
     with db.connection() as conn:
         with pytest.raises(psycopg.errors.CheckViolation):
             with conn.transaction():
-                conn.execute("INSERT INTO workflows (name) VALUES ('wf')")
+                conn.execute(
+                    "INSERT INTO workflows (name, user_id) VALUES ('wf', %s)", (db.test_user_id,)
+                )
                 wf_id = conn.execute("SELECT id FROM workflows ORDER BY id DESC LIMIT 1").fetchone()["id"]
                 conn.execute(
                     "INSERT INTO tasks (workflow_id, name, task_type, state, lease_owner, lease_expires_at) "
@@ -57,7 +60,9 @@ def test_attempt_bounds_rejects_attempt_count_over_max(db):
     with db.connection() as conn:
         with pytest.raises(psycopg.errors.CheckViolation):
             with conn.transaction():
-                conn.execute("INSERT INTO workflows (name) VALUES ('wf')")
+                conn.execute(
+                    "INSERT INTO workflows (name, user_id) VALUES ('wf', %s)", (db.test_user_id,)
+                )
                 wf_id = conn.execute("SELECT id FROM workflows ORDER BY id DESC LIMIT 1").fetchone()["id"]
                 conn.execute(
                     "INSERT INTO tasks (workflow_id, name, task_type, state, attempt_count, max_attempts) "
@@ -70,7 +75,9 @@ def test_max_attempts_positive_rejects_zero(db):
     with db.connection() as conn:
         with pytest.raises(psycopg.errors.CheckViolation):
             with conn.transaction():
-                conn.execute("INSERT INTO workflows (name) VALUES ('wf')")
+                conn.execute(
+                    "INSERT INTO workflows (name, user_id) VALUES ('wf', %s)", (db.test_user_id,)
+                )
                 wf_id = conn.execute("SELECT id FROM workflows ORDER BY id DESC LIMIT 1").fetchone()["id"]
                 conn.execute(
                     "INSERT INTO tasks (workflow_id, name, task_type, state, max_attempts) "
@@ -83,7 +90,9 @@ def test_no_self_dependency_rejects_self_edge(db):
     with db.connection() as conn:
         with pytest.raises(psycopg.errors.CheckViolation):
             with conn.transaction():
-                conn.execute("INSERT INTO workflows (name) VALUES ('wf')")
+                conn.execute(
+                    "INSERT INTO workflows (name, user_id) VALUES ('wf', %s)", (db.test_user_id,)
+                )
                 wf_id = conn.execute("SELECT id FROM workflows ORDER BY id DESC LIMIT 1").fetchone()["id"]
                 conn.execute(
                     "INSERT INTO tasks (workflow_id, name, task_type, state) "

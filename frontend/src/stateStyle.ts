@@ -25,6 +25,29 @@ export const STATE_COLOR_VAR: Record<TaskState, string> = {
   SKIPPED: "var(--c-skipped)",
 };
 
+// Plain-language label + icon for a non-technical Simple-mode reader.
+// PENDING/READY both read as "Waiting" -- the distinction (has unmet
+// dependencies vs. is next in line) is a scheduling detail, not something
+// a Simple-mode user needs to reason about. The raw enum stays available
+// everywhere via the badge's `title` attribute and in Advanced mode.
+export const STATE_LABEL: Record<TaskState, string> = {
+  PENDING: "Waiting",
+  READY: "Waiting",
+  RUNNING: "Running",
+  SUCCEEDED: "Done",
+  FAILED_TERMINAL: "Failed",
+  SKIPPED: "Skipped",
+};
+
+export const STATE_ICON: Record<TaskState, string> = {
+  PENDING: "⏳",
+  READY: "⏳",
+  RUNNING: "▶",
+  SUCCEEDED: "✓",
+  FAILED_TERMINAL: "✕",
+  SKIPPED: "⤼",
+};
+
 // The legal lifecycle path a task can be on, per core/transitions.py.
 // PENDING only appears for tasks with unmet dependencies; every task
 // that has no dependencies starts at READY directly. Used by

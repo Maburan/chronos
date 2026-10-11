@@ -20,7 +20,7 @@ LEASE = timedelta(minutes=5)
 
 
 def _seed_ready_tasks(db, n: int, *, max_attempts: int = 1) -> list[int]:
-    wf = persistence.create_workflow(db, name="concurrency-wf")
+    wf = persistence.create_workflow(db, name="concurrency-wf", user_id=db.test_user_id)
     ids = []
     for i in range(n):
         record = persistence.create_task(
@@ -206,7 +206,7 @@ def test_db_level_stale_report_fencing(db, db_dsn):
 
 
 def test_concurrent_fan_in_completion_promotes_downstream_exactly_once(db, db_dsn):
-    wf = persistence.create_workflow(db, name="fan-in-wf")
+    wf = persistence.create_workflow(db, name="fan-in-wf", user_id=db.test_user_id)
     x = persistence.create_task(db, workflow_id=wf["id"], name="x", task_type="noop")
     y = persistence.create_task(db, workflow_id=wf["id"], name="y", task_type="noop")
     z = persistence.create_task(
@@ -244,7 +244,7 @@ def test_concurrent_fan_in_completion_promotes_downstream_exactly_once(db, db_ds
 
 
 def test_invariant_fuzz_pass_under_concurrency(db, db_dsn):
-    wf = persistence.create_workflow(db, name="fuzz-wf")
+    wf = persistence.create_workflow(db, name="fuzz-wf", user_id=db.test_user_id)
     task_ids = []
     for i in range(15):
         record = persistence.create_task(

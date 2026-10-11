@@ -18,11 +18,12 @@ import pytest
 
 from db import persistence
 from mq.config import RelayConfig
+from mq.connection import BrokerUnavailableError
 from relay.outbox_relay import OutboxRelay, RelayIterationResult
 
 
 def _make_workflow(db):
-    return persistence.create_workflow(db, name="wf")
+    return persistence.create_workflow(db, name="wf", user_id=db.test_user_id)
 
 
 def _outbox_rows(db) -> list[dict]:
@@ -39,6 +40,7 @@ class FakePublisher:
         self.calls: list[tuple[str, bytes]] = []
         self._confirm = confirm
         self._raise_exc = raise_exc
+        self.closed = False
 
     def publish(self, *, routing_key: str, body: bytes) -> bool:
         self.calls.append((routing_key, body))
@@ -48,6 +50,9 @@ class FakePublisher:
 
     def decoded_calls(self) -> list[tuple[str, dict]]:
         return [(rk, json.loads(body)) for rk, body in self.calls]
+
+    def close(self) -> None:
+        self.closed = True
 
 
 # ---------------------------------------------------------------------------
@@ -417,3 +422,157 @@ def test_published_rows_are_not_deleted(db):
     with db.connection() as conn:
         count = conn.execute("SELECT count(*) AS n FROM outbox_events").fetchone()["n"]
     assert count == 1
+
+
+# ---------------------------------------------------------------------------
+# reconnect on a connection/channel-level publish failure
+#
+# Regresses the exact failure observed live: a relay's long-held RabbitMQ
+# connection dies mid-run (broker drops an idle connection / restarts /
+# a network blip), every publish attempt starts raising
+# BrokerUnavailableError, and -- before this fix -- nothing ever rebuilt
+# the connection, leaving the relay permanently stuck retrying against a
+# dead channel. See relay/outbox_relay.py::OutboxRelay._attempt_reconnect.
+# ---------------------------------------------------------------------------
+
+
+def test_reconnects_after_broker_unavailable_error_and_publishes_on_next_pass(db):
+    wf = _make_workflow(db)
+    persistence.create_task(db, workflow_id=wf["id"], name="t1", task_type="noop")
+
+    dead_publisher = FakePublisher(raise_exc=BrokerUnavailableError("connection reset"))
+    fresh_publisher = FakePublisher(confirm=True)
+    reconnect_calls = []
+
+    def reconnect():
+        reconnect_calls.append(1)
+        return fresh_publisher
+
+    relay = OutboxRelay(db, dead_publisher, reconnect=reconnect)
+
+    first = relay.run_once()
+    assert first.published == 0
+    assert first.errors == 1
+    assert len(reconnect_calls) == 1
+    assert relay.publisher is fresh_publisher
+    [event] = _outbox_rows(db)
+    assert event["published_at"] is None
+
+    second = relay.run_once()
+    assert second.published == 1
+    assert second.errors == 0
+    assert len(fresh_publisher.calls) == 1
+    [event] = _outbox_rows(db)
+    assert event["published_at"] is not None
+
+
+def test_broken_publisher_is_closed_during_reconnect(db):
+    wf = _make_workflow(db)
+    persistence.create_task(db, workflow_id=wf["id"], name="t1", task_type="noop")
+
+    dead_publisher = FakePublisher(raise_exc=BrokerUnavailableError("connection reset"))
+    fresh_publisher = FakePublisher(confirm=True)
+
+    relay = OutboxRelay(db, dead_publisher, reconnect=lambda: fresh_publisher)
+    relay.run_once()
+
+    assert dead_publisher.closed is True
+
+
+def test_does_not_reconnect_for_non_connection_level_errors(db):
+    """A generic publish exception (e.g. a bug, or some other unexpected
+    failure that isn't BrokerUnavailableError) must NOT trigger a
+    reconnect -- only a genuine connection/channel-level failure should.
+    Distinguishing the two is the whole point of this fix (see
+    mq/connection.py's ConfirmedPublisher.publish docstring)."""
+    wf = _make_workflow(db)
+    persistence.create_task(db, workflow_id=wf["id"], name="t1", task_type="noop")
+
+    publisher = FakePublisher(raise_exc=RuntimeError("some unrelated bug"))
+    reconnect_calls = []
+
+    def reconnect():
+        reconnect_calls.append(1)
+        return FakePublisher(confirm=True)
+
+    relay = OutboxRelay(db, publisher, reconnect=reconnect)
+    result = relay.run_once()
+
+    assert result.errors == 1
+    assert reconnect_calls == []
+    assert relay.publisher is publisher  # unchanged -- no reconnect happened
+
+
+def test_no_reconnect_callable_preserves_original_behavior(db):
+    """Omitting `reconnect` (the default) must behave exactly as before
+    this fix existed: a BrokerUnavailableError is just logged and
+    counted, the same (still-broken) publisher keeps being used."""
+    wf = _make_workflow(db)
+    persistence.create_task(db, workflow_id=wf["id"], name="t1", task_type="noop")
+
+    publisher = FakePublisher(raise_exc=BrokerUnavailableError("connection reset"))
+    relay = OutboxRelay(db, publisher)  # no reconnect=
+
+    result = relay.run_once()
+
+    assert result.errors == 1
+    assert relay.publisher is publisher
+
+
+def test_failed_reconnect_attempt_does_not_raise_and_leaves_event_unpublished(db):
+    wf = _make_workflow(db)
+    persistence.create_task(db, workflow_id=wf["id"], name="t1", task_type="noop")
+
+    dead_publisher = FakePublisher(raise_exc=BrokerUnavailableError("connection reset"))
+
+    def failing_reconnect():
+        raise BrokerUnavailableError("broker still unreachable")
+
+    relay = OutboxRelay(db, dead_publisher, reconnect=failing_reconnect)
+
+    result = relay.run_once()  # must not raise
+
+    assert result.published == 0
+    assert result.errors == 1
+    assert relay.publisher is dead_publisher  # reconnect failed -- unchanged
+    [event] = _outbox_rows(db)
+    assert event["published_at"] is None
+
+
+def test_run_forever_recovers_from_connection_loss_mid_run(db):
+    """End-to-end through run_forever: a connection-level failure on the
+    first pass triggers a reconnect, and a later pass (using the fresh
+    publisher) successfully publishes and the relay keeps running
+    normally -- proving the relay is no longer permanently stuck after a
+    connection loss, without needing a process restart."""
+    wf = _make_workflow(db)
+    persistence.create_task(db, workflow_id=wf["id"], name="t1", task_type="noop")
+
+    dead_publisher = FakePublisher(raise_exc=BrokerUnavailableError("connection reset"))
+    fresh_publisher = FakePublisher(confirm=True)
+
+    relay = OutboxRelay(
+        db,
+        dead_publisher,
+        config=RelayConfig(
+            batch_size=10, poll_interval_seconds=0.01,
+            initial_backoff_seconds=0.02, max_backoff_seconds=0.05,
+        ),
+        reconnect=lambda: fresh_publisher,
+    )
+
+    results = []
+    call_count = 0
+
+    def stop_check() -> bool:
+        nonlocal call_count
+        call_count += 1
+        return call_count > 3
+
+    relay.run_forever(stop_check=stop_check, on_iteration=results.append)
+
+    # First iteration hit the dead publisher and reconnected; a later
+    # iteration used the fresh one and actually published.
+    assert any(r.published == 1 for r in results)
+    [event] = _outbox_rows(db)
+    assert event["published_at"] is not None
